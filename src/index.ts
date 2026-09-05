@@ -318,6 +318,16 @@ export interface Usage {
 /**
  * One quota bucket the provider reported — `requests`, `tokens`, and so on.
  *
+ * NOT CONTENT, and therefore NOT behind `captureContent`. A bucket is a name,
+ * two integers and a reset instant, all read off a response header the provider
+ * chose; nothing the user wrote and nothing the model returned can reach it.
+ * `input.value` and `output.value` are what the gate exists for, and they go
+ * through `#capture`; these do not, deliberately, and moving them behind the
+ * switch would be a regression rather than a tidy-up. It was one in the
+ * reference (G-45): quota headroom rode on the content switch, so a successful
+ * generation exported no quota under the default config and an operator saw the
+ * numbers only once a 429 had already made them useless as headroom.
+ *
  * `resetsAt` is a `Date` and NOT a number, so there is no chance of a caller
  * handing over seconds where the code expected milliseconds; the conversion to
  * the exported epoch happens in exactly one place.
@@ -480,6 +490,8 @@ export class TelemetrySubscriber {
       span.setAttribute(GenAi.RESPONSE_FINISH_REASONS, [result.finishReason]);
     }
 
+    // Usage and rate limits are unconditional; only the output goes through
+    // the content gate. Three parameters, two privacy classes -- see RateLimit.
     this.#applyUsage(span, result.usage);
     this.#applyRateLimits(span, result.rateLimits);
     this.#capture(span, OpenInference.OUTPUT_VALUE, result.output, OpenInference.OUTPUT_MIME_TYPE);
