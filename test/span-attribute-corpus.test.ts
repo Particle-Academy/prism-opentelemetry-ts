@@ -1,6 +1,13 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { SpanStore, TelemetrySubscriber, type Span, type Tracer } from '../src/index.js';
+import {
+  GenAi,
+  SpanStore,
+  TelemetrySubscriber,
+  type RateLimit,
+  type Span,
+  type Tracer,
+} from '../src/index.js';
 
 /**
  * The cross-language span-attribute corpus from `prism-parity`.
@@ -27,6 +34,13 @@ interface RecordedSpan {
   attributes: Record<string, unknown>;
 }
 
+interface CorpusRateLimit {
+  name: string;
+  limit: number | null;
+  remaining: number | null;
+  resets_at: string | null;
+}
+
 interface CorpusCase {
   id: string;
   title: string;
@@ -40,6 +54,7 @@ interface CorpusCase {
     usage: { prompt_tokens: number; completion_tokens: number; cost: number | null } | null;
     input: Record<string, unknown> | null;
     output: Record<string, unknown> | null;
+    rate_limits: CorpusRateLimit[] | null;
   };
   capture_content: boolean;
   max_content_length: number;
@@ -95,6 +110,7 @@ function record(entry: CorpusCase): RecordedSpan {
 
   subscriber.onGenerationCompleted(entry.id, {
     finishReason: g.finish_reason,
+    rateLimits: g.rate_limits === null ? undefined : g.rate_limits.map(rateLimit),
     usage:
       g.usage === null
         ? undefined
@@ -119,11 +135,34 @@ function record(entry: CorpusCase): RecordedSpan {
   };
 }
 
+/**
+ * A corpus bucket as this port's bridge takes one.
+ *
+ * `resets_at` is parsed HERE and not in the bridge: the bridge is handed an
+ * instant, so nothing in this comparison depends on three languages agreeing
+ * about how to render or re-render a date.
+ */
+function rateLimit(entry: CorpusRateLimit): RateLimit {
+  return {
+    name: entry.name,
+    limit: entry.limit,
+    remaining: entry.remaining,
+    resetsAt: entry.resets_at === null ? null : new Date(entry.resets_at),
+  };
+}
+
 const caseOf = (id: string): CorpusCase => corpus.cases.find((entry) => entry.id === id)!;
+
+/** Just the rate-limit attributes of an attribute map. */
+function rateLimitAttributesOf(attributes: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(attributes).filter(([key]) => key.startsWith(GenAi.RATE_LIMIT_PREFIX)),
+  );
+}
 
 describe('the cross-language span-attribute corpus', () => {
   it('is the whole suite, not a subset someone trimmed to green', () => {
-    expect(corpus.cases).toHaveLength(13);
+    expect(corpus.cases).toHaveLength(18);
   });
 
   it.each(corpus.cases)('$id emits its recorded span ($title)', (entry) => {
@@ -206,6 +245,142 @@ describe('the cross-language span-attribute corpus', () => {
     expect(value).toBe('{"prompt":"日本語のテ…[truncated]');
     expect(value).not.toBe(entry.spans.php.attributes['input.value']);
     expect(value).not.toBe(entry.spans.py.attributes['input.value']);
+  });
+
+  it('exports the provider rate limits, which no semantic convention names', () => {
+    // The OpenTelemetry GenAI conventions define NOTHING for rate limits or
+    // quota — checked 2026-09-05 against the gen_ai and http attribute
+    // registries. `gen_ai.error.type` has a `rate_limit` member, but that names
+    // a failure rather than a headroom, and the nearest mechanism in all of
+    // semconv is the generic opt-in `http.response.header.<key>` capture, which
+    // records a header verbatim and knows nothing about the bucket it belongs
+    // to. So these keys are OURS, and they live under `prism.` rather than
+    // inside `gen_ai.` so a real convention can arrive later without two
+    // spellings meaning subtly different things.
+    expect(record(caseOf('otel-0014')).attributes).toMatchObject({
+      'prism.rate_limit.buckets': ['requests'],
+      'prism.rate_limit.requests.limit': 1000,
+      'prism.rate_limit.requests.remaining': 999,
+      'prism.rate_limit.requests.resets_at_unix': 1788611696,
+    });
+  });
+
+  it('writes a key only for the fields the provider actually sent', () => {
+    // A quota of zero and a quota nobody reported are different facts, and 0
+    // says the first when the truth is the second. The cost precedent, one
+    // level down.
+    const attributes = record(caseOf('otel-0015')).attributes;
+
+    expect(attributes).toHaveProperty('prism.rate_limit.input-tokens.limit');
+    expect(attributes).not.toHaveProperty('prism.rate_limit.input-tokens.resets_at_unix');
+    expect(attributes).not.toHaveProperty('prism.rate_limit.output-tokens.limit');
+  });
+
+  it('writes NOTHING when the provider reported no rate limits at all', () => {
+    // Present-and-empty and absent are different values to a backend, and this
+    // is the COMMON case rather than an edge one: several providers report no
+    // quota headers at all, in every language. An empty `buckets` array would
+    // put "we asked, there is no quota" on every span they touch.
+    expect(rateLimitAttributesOf(record(caseOf('otel-0016')).attributes)).toEqual({});
+  });
+
+  it('refuses every hostile spelling of a bucket name, and keeps the real one', () => {
+    // A bucket name is chosen by the PROVIDER and becomes part of an attribute
+    // KEY — the G-36 shape, one layer out. Seven hostile spellings of `tokens`
+    // (trailing space, trailing newline, case fold, Cyrillic homoglyph, an
+    // embedded dot that would forge a nested key, an empty name, and a
+    // duplicate appended after the real bucket) and one real one.
+    //
+    // Dropped rather than normalised: normalising means two distinct names can
+    // collapse onto one key, at which point the hostile bucket overwrites the
+    // real bucket's numbers instead of being ignored. The duplicate carried 8,
+    // so FIRST winning is what keeps 7 on the span.
+    expect(rateLimitAttributesOf(record(caseOf('otel-0017')).attributes)).toEqual({
+      'prism.rate_limit.buckets': ['tokens'],
+      'prism.rate_limit.tokens.limit': 7,
+      'prism.rate_limit.tokens.remaining': 7,
+    });
+  });
+
+  it('caps how many buckets a span can carry, however well-formed they are', () => {
+    // The alphabet gate bounds what a key may LOOK like and not how many there
+    // are, and backends index keys.
+    const attributes = record(caseOf('otel-0018')).attributes;
+    const buckets = attributes['prism.rate_limit.buckets'] as string[];
+
+    expect(buckets).toHaveLength(GenAi.RATE_LIMIT_MAX_BUCKETS);
+    expect(buckets[0]).toBe('b00');
+    expect(attributes).not.toHaveProperty('prism.rate_limit.b16.limit');
+  });
+
+  it('exports the SAME rate-limit attributes as the reference and the other port', () => {
+    // The one thing in this suite that AGREES. Every other row is pinned
+    // against its own language's recorded span, which is exactly the assertion
+    // that cannot see a cross-language divergence — so the rate-limit keys are
+    // compared here across the three recorded maps directly.
+    let compared = 0;
+
+    for (const entry of corpus.cases) {
+      const php = rateLimitAttributesOf(entry.spans.php.attributes);
+
+      expect(php).toEqual(rateLimitAttributesOf(entry.spans.ts.attributes));
+      expect(php).toEqual(rateLimitAttributesOf(entry.spans.py.attributes));
+
+      compared += Object.keys(php).length;
+    }
+
+    // Vacuity guard: three empty maps agree about nothing.
+    expect(compared).toBe(48);
+  });
+
+  it('exports the rate limits a rate-limited generation FAILED with', () => {
+    // The 429 is the moment an operator most wants these numbers, and the one
+    // moment they cannot arrive on a response — there is no response.
+    const spans: RecordedSpan[] = [];
+    const tracer: Tracer = {
+      startSpan(name: string): Span {
+        const recorded: RecordedSpan = { name, status: 'unset', attributes: {} };
+        spans.push(recorded);
+        return {
+          setAttribute(key, value) {
+            recorded.attributes[key] = value;
+          },
+          setStatus(status) {
+            recorded.status = status.code;
+          },
+          recordException() {},
+          end() {},
+        };
+      },
+    };
+
+    const subscriber = new TelemetrySubscriber(tracer, new SpanStore(), { now: () => 0 });
+    subscriber.onGenerationStarted({
+      traceId: 'rate-limited',
+      operation: 'text',
+      provider: 'anthropic',
+      model: 'claude-sonnet-4-5',
+    });
+
+    const error = Object.assign(new Error('rate limited'), {
+      rateLimits: [
+        {
+          name: 'requests',
+          limit: 50,
+          remaining: 0,
+          resetsAt: new Date(1788611696 * 1000),
+        },
+      ],
+    });
+
+    subscriber.onGenerationFailed('rate-limited', error);
+
+    expect(spans[0]!.attributes).toMatchObject({
+      'prism.rate_limit.buckets': ['requests'],
+      'prism.rate_limit.requests.limit': 50,
+      'prism.rate_limit.requests.remaining': 0,
+      'prism.rate_limit.requests.resets_at_unix': 1788611696,
+    });
   });
 
   it('REFUSES content that reaches it with capture off, which the reference does not', () => {

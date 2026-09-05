@@ -21,6 +21,98 @@ export const GenAi = {
   STEP_INDEX: 'prism.step.index',
   TOOL_INDEX: 'prism.tool.index',
   OPERATION_EXECUTE_TOOL: 'execute_tool',
+
+  /**
+   * Provider rate limits — quota headroom, beside the latency.
+   *
+   * THE SEMANTIC CONVENTIONS DEFINE NOTHING FOR THIS. Checked 2026-09-05
+   * against the gen_ai and http attribute registries: `gen_ai.*` has usage,
+   * request and response namespaces and no quota anywhere in them, and the
+   * closest thing in all of semconv is the generic, opt-in
+   * `http.response.header.<key>` capture — which records a header verbatim and
+   * knows nothing about which bucket it describes. `gen_ai.error.type` has a
+   * `rate_limit` member, but that names a failure, not a headroom.
+   *
+   * So these are CUSTOM names, under `prism.` beside `STEP_INDEX` rather than
+   * inside `gen_ai.`. Squatting in a standard namespace is worse than being
+   * outside it: when a real `gen_ai.rate_limit.*` arrives, a backend must not
+   * find two spellings of it meaning subtly different things. (`USAGE_COST`
+   * above is the counter-example already in this file: it claims to be
+   * namespaced away from semconv while sitting directly inside
+   * `gen_ai.usage.`.)
+   *
+   * A rate limit is a LIST of buckets — requests, tokens, input-tokens — and a
+   * span attribute is flat, so the list is flattened BY BUCKET NAME:
+   *
+   *     prism.rate_limit.buckets                  ["requests","tokens"]
+   *     prism.rate_limit.requests.limit           1000
+   *     prism.rate_limit.requests.remaining       999
+   *     prism.rate_limit.requests.resets_at_unix  1788611696
+   *
+   * Name-keyed rather than index-keyed (`…rate_limit.0.limit`) or serialised
+   * into one JSON blob, because the whole point is that a backend can FILTER on
+   * it: `prism.rate_limit.tokens.remaining < 1000` is a numeric predicate a
+   * dashboard can express, and it does not depend on which position the
+   * provider happened to list the bucket in. A JSON blob is unfilterable, and
+   * an index is a stable key for an unstable thing.
+   *
+   * The cost of name-keying is that the ATTRIBUTE KEY SPACE becomes
+   * provider-controlled, which is a real hazard — backends index keys, and
+   * unbounded keys are how an observability bill becomes an incident. Hence the
+   * alphabet and the bucket cap below.
+   */
+  RATE_LIMIT_PREFIX: 'prism.rate_limit.',
+  RATE_LIMIT_BUCKETS: 'prism.rate_limit.buckets',
+  RATE_LIMIT_FIELD_LIMIT: 'limit',
+  RATE_LIMIT_FIELD_REMAINING: 'remaining',
+
+  /**
+   * An INTEGER Unix epoch in SECONDS, floored — never a formatted date.
+   *
+   * Date formatting is precisely where three languages produce three strings
+   * from one instant: an ISO-8601 rendering differs on the offset spelling
+   * (`+00:00` vs `Z`), on whether fractional seconds appear, and on how many
+   * digits of them. None of that errors; the two services simply stop matching.
+   * An integer has one spelling in all three languages.
+   *
+   * The `_unix` suffix is not decoration. The reference's `ProviderRateLimit`
+   * serialises `resets_at` as an ISO-8601 STRING, and a reader who saw the same
+   * key here would reasonably expect the same value.
+   */
+  RATE_LIMIT_FIELD_RESETS_AT: 'resets_at_unix',
+
+  /**
+   * The only characters a bucket name may contain, spelled out.
+   *
+   * Not a regex, not `toLowerCase()` — an explicit codepoint set, spelled
+   * identically in PHP, TypeScript and Python. This ecosystem has been bitten
+   * by the alternative: a single trailing space defeated a tool-name
+   * reservation in all three languages at once, and closing it with each
+   * language's own `trim()` would have shut the ASCII hole and opened three new
+   * Unicode ones.
+   *
+   * A bucket whose name contains anything else is DROPPED, not repaired.
+   * Repairing means normalising, and normalising means two distinct names can
+   * collapse onto one key — so a bucket called `tokens\u200B` could overwrite
+   * the real `tokens`. Dropping cannot collide with anything.
+   *
+   * Every accepted character is one byte, so the length limit measures the same
+   * thing whether counted in bytes (PHP), UTF-16 code units (JavaScript) or
+   * codepoints (Python). That is why the alphabet is checked FIRST and the
+   * length second.
+   */
+  RATE_LIMIT_NAME_ALPHABET: 'abcdefghijklmnopqrstuvwxyz0123456789-_',
+  RATE_LIMIT_MAX_NAME_LENGTH: 64,
+
+  /**
+   * At most this many buckets reach a span, in the order the provider gave.
+   *
+   * The alphabet gate bounds what a key may LOOK like; it does not bound how
+   * many there are. A provider (or anything sitting between us and one) that
+   * returned ten thousand well-formed bucket names would otherwise put ten
+   * thousand distinct attribute keys on every span.
+   */
+  RATE_LIMIT_MAX_BUCKETS: 16,
 } as const;
 
 /** OpenInference keys, which is what Phoenix and Arize read. */
@@ -223,6 +315,25 @@ export interface Usage {
   cost?: number | null;
 }
 
+/**
+ * One quota bucket the provider reported — `requests`, `tokens`, and so on.
+ *
+ * `resetsAt` is a `Date` and NOT a number, so there is no chance of a caller
+ * handing over seconds where the code expected milliseconds; the conversion to
+ * the exported epoch happens in exactly one place.
+ *
+ * The field names are `prism-ts`'s own rather than a translation of them: its
+ * `ProviderRateLimit` carries exactly `name`, `limit`, `remaining` and
+ * `resetsAt`, so one satisfies this interface structurally and can be handed
+ * over directly. A shape invented here would have needed an adapter forever.
+ */
+export interface RateLimit {
+  name: string;
+  limit?: number | null;
+  remaining?: number | null;
+  resetsAt?: Date | null;
+}
+
 export interface TelemetryOptions {
   recordExceptions?: boolean;
   /**
@@ -348,7 +459,12 @@ export class TelemetrySubscriber {
 
   onGenerationCompleted(
     traceId: string,
-    result: { finishReason?: string | null; usage?: Usage; output?: unknown } = {},
+    result: {
+      finishReason?: string | null;
+      usage?: Usage;
+      output?: unknown;
+      rateLimits?: readonly RateLimit[] | null;
+    } = {},
   ): void {
     const span = this.#store.span(traceId);
     if (span === null) return;
@@ -365,6 +481,7 @@ export class TelemetrySubscriber {
     }
 
     this.#applyUsage(span, result.usage);
+    this.#applyRateLimits(span, result.rateLimits);
     this.#capture(span, OpenInference.OUTPUT_VALUE, result.output, OpenInference.OUTPUT_MIME_TYPE);
 
     span.setStatus({ code: 'ok' });
@@ -378,6 +495,14 @@ export class TelemetrySubscriber {
 
     for (const [index, tool] of this.#store.takeRemainingTools(traceId).entries()) {
       this.#emitTool(tool, span, index);
+    }
+
+    // The 429 is the moment an operator most wants the quota numbers, and it is
+    // the one moment they are guaranteed to be reachable: a rate limited
+    // generation has no response for them to travel on, so they travel on the
+    // error instead.
+    if (typeof error === 'object' && error !== null && 'rateLimits' in error) {
+      this.#applyRateLimits(span, (error as { rateLimits?: unknown }).rateLimits);
     }
 
     if (this.#recordExceptions) span.recordException(error);
@@ -446,6 +571,83 @@ export class TelemetrySubscriber {
     if (typeof usage.cost === 'number') {
       span.setAttribute(GenAi.USAGE_COST, usage.cost);
     }
+  }
+
+  /**
+   * Flatten the provider's rate-limit buckets onto the span.
+   *
+   * Present-and-empty and absent are different values to a backend, so a
+   * provider that reported no rate limits writes NOTHING here. That is the
+   * ORDINARY case rather than an edge one: several providers report no quota
+   * headers at all. An empty `prism.rate_limit.buckets` would claim we asked
+   * and were told nothing, which is not the same as never having been told.
+   *
+   * The same rule one level down: a bucket contributes a key only for the
+   * fields the provider actually sent, and a bucket that sent no field at all
+   * does not appear in `buckets` either. See `GenAi` for why the flattening is
+   * by name, and what bounds the key space.
+   *
+   * Takes `unknown` rather than `RateLimit[]`: the failure path is handed an
+   * arbitrary thrown value, and a type annotation is not a runtime check.
+   */
+  #applyRateLimits(span: Span, rateLimits: unknown): void {
+    if (!Array.isArray(rateLimits)) return;
+
+    const exported: string[] = [];
+
+    for (const entry of rateLimits as readonly unknown[]) {
+      if (exported.length >= GenAi.RATE_LIMIT_MAX_BUCKETS) break;
+      if (typeof entry !== 'object' || entry === null) continue;
+
+      const limit = entry as Partial<RateLimit>;
+      const name = typeof limit.name === 'string' ? this.#rateLimitBucketName(limit.name) : null;
+
+      // FIRST bucket of a name wins. A later duplicate — which only a
+      // hand-built list or a hostile provider produces — must not be able to
+      // overwrite the numbers already on the span.
+      if (name === null || exported.includes(name)) continue;
+
+      const fields: [string, number][] = [];
+
+      if (Number.isInteger(limit.limit)) {
+        fields.push([GenAi.RATE_LIMIT_FIELD_LIMIT, limit.limit as number]);
+      }
+
+      if (Number.isInteger(limit.remaining)) {
+        fields.push([GenAi.RATE_LIMIT_FIELD_REMAINING, limit.remaining as number]);
+      }
+
+      // Seconds, FLOORED — the same direction as PHP's
+      // DateTimeInterface::getTimestamp() and Python's math.floor.
+      if (limit.resetsAt instanceof Date && Number.isFinite(limit.resetsAt.getTime())) {
+        fields.push([GenAi.RATE_LIMIT_FIELD_RESETS_AT, Math.floor(limit.resetsAt.getTime() / 1000)]);
+      }
+
+      if (fields.length === 0) continue;
+
+      for (const [field, value] of fields) {
+        span.setAttribute(`${GenAi.RATE_LIMIT_PREFIX}${name}.${field}`, value);
+      }
+
+      exported.push(name);
+    }
+
+    if (exported.length > 0) span.setAttribute(GenAi.RATE_LIMIT_BUCKETS, exported);
+  }
+
+  /**
+   * A bucket name that is safe to make part of an attribute KEY, or null.
+   *
+   * Alphabet first, length second — see `GenAi.RATE_LIMIT_NAME_ALPHABET`.
+   */
+  #rateLimitBucketName(name: string): string | null {
+    if (name === '') return null;
+
+    for (const character of name) {
+      if (!GenAi.RATE_LIMIT_NAME_ALPHABET.includes(character)) return null;
+    }
+
+    return name.length > GenAi.RATE_LIMIT_MAX_NAME_LENGTH ? null : name;
   }
 
   /**
