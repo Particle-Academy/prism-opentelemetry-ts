@@ -1,6 +1,6 @@
 {
   "name": "@particle-academy/prism-opentelemetry",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "GenAI-convention OpenTelemetry spans from Prism telemetry, for TypeScript.",
   "type": "module",
   "sideEffects": false,
