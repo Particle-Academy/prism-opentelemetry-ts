@@ -399,3 +399,41 @@ describe('captured content', () => {
     expect(JSON.stringify(spans)).not.toContain('secret');
   });
 });
+
+describe('media inside captured content', () => {
+  // Content capture was understood to export TEXT. A serialized message carries
+  // each attachment's bytes, so without this a span carried the user's file.
+  const input = {
+    messages: [
+      {
+        type: 'user',
+        content: 'What is in this?',
+        additional_content: [
+          { kind: 'image', url: null, base64: Buffer.from('SECRET-FILE-BYTES').toString('base64'), mime_type: 'image/png', file_id: null, filename: null },
+          { text: 'What is in this?' },
+        ],
+      },
+    ],
+  };
+
+  it('withholds the bytes by default, and says how big they were', () => {
+    const { tracer, spans } = recorder();
+    new TelemetrySubscriber(tracer, new SpanStore(), { captureContent: true, now: clock() }).onGenerationStarted(context, input);
+
+    const captured = String(spans[0]!.attributes[OpenInference.INPUT_VALUE]);
+
+    expect(captured).toContain('What is in this?');
+    expect(captured).toContain('"omitted_bytes":17');
+    expect(captured).not.toContain(Buffer.from('SECRET-FILE-BYTES').toString('base64'));
+  });
+
+  it('sends the bytes when captureMedia is on', () => {
+    const { tracer, spans } = recorder();
+    new TelemetrySubscriber(tracer, new SpanStore(), { captureContent: true, captureMedia: true, now: clock() }).onGenerationStarted(context, input);
+
+    const captured = String(spans[0]!.attributes[OpenInference.INPUT_VALUE]);
+
+    expect(captured).toContain(Buffer.from('SECRET-FILE-BYTES').toString('base64'));
+    expect(captured).not.toContain('omitted_bytes');
+  });
+});

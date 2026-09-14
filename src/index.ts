@@ -362,7 +362,54 @@ export interface TelemetryOptions {
    * nobody has to infer from three config keys whether content is leaving.
    */
   captureContent?: boolean;
+  /**
+   * Send media BYTES inside captured content. OFF BY DEFAULT, and meaningless
+   * unless `captureContent` is on.
+   *
+   * A serialized message carries each attachment's bytes, and content capture
+   * was understood to export text. Off, a media part keeps its kind, mime type
+   * and file id and its bytes are replaced by `omitted_bytes`. See
+   * `withoutMediaBytes`.
+   */
+  captureMedia?: boolean;
   now?: () => number;
+}
+
+const MEDIA_KINDS = new Set(['image', 'audio', 'video', 'document']);
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Captured content with media bytes taken out.
+ *
+ * A media part is recognised by its serialized SHAPE: a `kind` of image, audio,
+ * video or document beside a `base64` key, or, for the reference's stored form
+ * from before prism v0.120.0, `base64` beside `mime_type` and `file_id`. Its
+ * bytes become `base64: null` plus `omitted_bytes`, the decoded size. The PHP
+ * and Python bridges apply the same rule, pinned by prism-parity's
+ * `opentelemetry-media-content` corpus.
+ */
+export function withoutMediaBytes(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutMediaBytes);
+  if (!isPlainObject(value)) return value;
+
+  const out: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value)) out[key] = withoutMediaBytes(item);
+
+  const isMedia =
+    Object.hasOwn(value, 'base64') &&
+    (typeof value.kind === 'string'
+      ? MEDIA_KINDS.has(value.kind)
+      : (value.kind === undefined || value.kind === null) && Object.hasOwn(value, 'mime_type') && Object.hasOwn(value, 'file_id'));
+
+  if (isMedia && typeof value.base64 === 'string' && value.base64 !== '') {
+    out.base64 = null;
+    out.omitted_bytes = Buffer.from(value.base64, 'base64').length;
+  }
+
+  return out;
 }
 
 /**
@@ -383,6 +430,8 @@ export class TelemetrySubscriber {
 
   readonly #captureContent: boolean;
 
+  readonly #captureMedia: boolean;
+
   readonly #now: () => number;
 
   constructor(tracer: Tracer, store: SpanStore = new SpanStore(), options: TelemetryOptions = {}) {
@@ -391,6 +440,7 @@ export class TelemetrySubscriber {
     this.#recordExceptions = options.recordExceptions ?? true;
     this.#maxContentLength = options.maxContentLength ?? 65_536;
     this.#captureContent = options.captureContent ?? false;
+    this.#captureMedia = options.captureMedia ?? false;
     this.#now = options.now ?? (() => Date.now() * 1_000_000);
   }
 
@@ -671,7 +721,7 @@ export class TelemetrySubscriber {
   #capture(span: Span, key: string, value: unknown, mimeKey: string | null): void {
     if (!this.#captureContent || value === undefined || value === null) return;
 
-    const text = typeof value === 'string' ? value : JSON.stringify(value);
+    const text = typeof value === 'string' ? value : JSON.stringify(this.#captureMedia ? value : withoutMediaBytes(value));
     if (text === undefined) return;
 
     span.setAttribute(key, this.#bounded(text));
