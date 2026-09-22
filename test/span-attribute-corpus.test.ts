@@ -4,6 +4,7 @@ import {
   GenAi,
   SpanStore,
   TelemetrySubscriber,
+  advertisedToolDigest,
   type RateLimit,
   type Span,
   type Tracer,
@@ -51,7 +52,15 @@ interface CorpusCase {
     session_id: string | null;
     user_id: string | null;
     finish_reason: string | null;
-    usage: { prompt_tokens: number; completion_tokens: number; cost: number | null } | null;
+    usage: {
+      prompt_tokens: number;
+      completion_tokens: number;
+      cache_read_input_tokens?: number | null;
+      cache_write_input_tokens?: number | null;
+      thought_tokens?: number | null;
+      cost: number | null;
+    } | null;
+    tools?: { name: string; description?: string | null; parameters?: unknown }[] | null;
     input: Record<string, unknown> | null;
     output: Record<string, unknown> | null;
     rate_limits: CorpusRateLimit[] | null;
@@ -106,6 +115,23 @@ function record(entry: CorpusCase): RecordedSpan {
       userId: g.user_id,
     },
     g.input ?? undefined,
+    // Absent stays absent: a row with no `tools` key must produce a span with
+    // no tool attributes, which is a different assertion from a row carrying an
+    // empty list. The DIGEST is computed here from the declaration the row
+    // supplies, never copied from it — that is what makes the digest a compared
+    // value rather than a fixture echoed back.
+    g.tools === undefined || g.tools === null
+      ? undefined
+      : g.tools.map((tool) => ({
+          name: tool.name,
+          digest: advertisedToolDigest({
+            name: tool.name,
+            description: tool.description ?? '',
+            parameters: tool.parameters ?? {},
+          }),
+          description: tool.description ?? undefined,
+          parameters: tool.parameters ?? undefined,
+        })),
   );
 
   subscriber.onGenerationCompleted(entry.id, {
@@ -117,6 +143,12 @@ function record(entry: CorpusCase): RecordedSpan {
         : {
             promptTokens: g.usage.prompt_tokens,
             completionTokens: g.usage.completion_tokens,
+            // Optional in the fixture: rows predating cache reporting carry no
+            // such keys, and undefined is how the port is told a provider
+            // reported nothing — which is NOT the same as zero.
+            cacheReadInputTokens: g.usage.cache_read_input_tokens ?? undefined,
+            cacheWriteInputTokens: g.usage.cache_write_input_tokens ?? undefined,
+            thoughtTokens: g.usage.thought_tokens ?? undefined,
             cost: g.usage.cost,
           },
     output: g.output ?? undefined,
@@ -162,7 +194,7 @@ function rateLimitAttributesOf(attributes: Record<string, unknown>): Record<stri
 
 describe('the cross-language span-attribute corpus', () => {
   it('is the whole suite, not a subset someone trimmed to green', () => {
-    expect(corpus.cases).toHaveLength(18);
+    expect(corpus.cases).toHaveLength(23);
   });
 
   it.each(corpus.cases)('$id emits its recorded span ($title)', (entry) => {

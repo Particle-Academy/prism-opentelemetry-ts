@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 /**
  * OpenTelemetry GenAI semantic-convention attribute and value keys.
  *
@@ -369,6 +371,67 @@ export interface AdvertisedTool {
   digest: string;
   description?: string | null;
   parameters?: unknown;
+}
+
+/**
+ * The fingerprint of a tool's declaration, computed as the reference computes it.
+ *
+ * WHY THIS EXISTS. The digest is on a span to be compared ACROSS services, and
+ * for a while this package only ACCEPTED one — so a TypeScript service and a
+ * PHP service instrumenting the same agent emitted whatever digest each caller
+ * had invented, and a comparison of them meant nothing. An attribute that is
+ * not comparable across services is not doing the one job it has.
+ *
+ * NAME, DESCRIPTION AND PARAMETERS, because all three are in the prefix a
+ * provider caches. A digest over the name alone would answer "was this tool
+ * present", which the name already answers; the question worth asking is "did
+ * what this tool claims to do change", and a rewritten description moves the
+ * cached prefix without moving any name.
+ *
+ * AN ABSENT PARAMETER MAP IS `{}`, NOT `[]`. That is not a stylistic choice: PHP
+ * cannot tell an empty map from an empty list, and the reference shipped a
+ * version hashing `[]` here — making the digest for the commonest tool shape
+ * there is unreproducible outside PHP. Fixed in particle-academy/prism 0.124.1.
+ *
+ * NOT AN MCP TRUST PIN. `prism-mcp` hashes a tool definition too, for a
+ * different question over different inputs. The two WILL differ and comparing
+ * them produces a confident wrong conclusion.
+ */
+export function advertisedToolDigest(tool: {
+  name: string;
+  description?: string | null;
+  parameters?: unknown;
+}): string {
+  const canonical = canonicalise({
+    name: tool.name,
+    description: tool.description ?? '',
+    parameters: tool.parameters ?? {},
+  });
+
+  return `sha256:${createHash('sha256').update(JSON.stringify(canonical), 'utf8').digest('hex')}`;
+}
+
+/**
+ * Sort every map key, at every depth, leaving lists in their order.
+ *
+ * A digest is only comparable if two languages building the same tool produce
+ * the same bytes, and map iteration order is an implementation detail in all
+ * three. Sorting makes it not one.
+ *
+ * LISTS ARE NOT SORTED, and that is the distinction the whole thing turns on:
+ * `required: ["b","a"]` is a different JSON Schema from `required: ["a","b"]`,
+ * and reordering it here would give two genuinely different tools one digest.
+ * Only a map's KEY ORDER is meaningless.
+ */
+function canonicalise(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalise);
+  if (value === null || typeof value !== 'object') return value;
+
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .sort(([a], [b]) => (a < b ? -1 : 1))
+      .map(([key, nested]) => [key, canonicalise(nested)]),
+  );
 }
 
 export interface Usage {
