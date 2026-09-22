@@ -306,6 +306,67 @@ describe('usage', () => {
     // And no bogus total from one half of the pair.
     expect(spans[0]?.attributes).not.toHaveProperty(OpenInference.TOKEN_COUNT_TOTAL);
   });
+
+  it('counts cached prompt tokens as input, and breaks them out', () => {
+    // prism-opentelemetry#1. Three of Usage's five token fields were dropped
+    // entirely, and the input count excluded the cache while both conventions
+    // define it to INCLUDE the cache. The numbers are the reporter's: a turn
+    // where 35,600 tokens went in and the span said 922. A cost view reading
+    // that under-reports ~97% on exactly the workload caching exists for, and
+    // quietly, because 922 is plausible for a short question.
+    const { tracer, spans } = recorder();
+    const subscriber = new TelemetrySubscriber(tracer, new SpanStore(), { now: clock() });
+
+    subscriber.onGenerationStarted(context);
+    subscriber.onGenerationCompleted('trace-1', {
+      usage: {
+        promptTokens: 922,
+        completionTokens: 210,
+        cacheReadInputTokens: 34_678,
+        cacheWriteInputTokens: 0,
+        thoughtTokens: 64,
+      },
+    });
+
+    expect(spans[0]?.attributes).toMatchObject({
+      // 922 + 34,678. The sum, not the field.
+      [GenAi.USAGE_INPUT_TOKENS]: 35_600,
+      [GenAi.USAGE_OUTPUT_TOKENS]: 210,
+      [GenAi.USAGE_CACHE_READ_INPUT_TOKENS]: 34_678,
+      [GenAi.USAGE_CACHE_WRITE_INPUT_TOKENS]: 0,
+      [GenAi.USAGE_REASONING_OUTPUT_TOKENS]: 64,
+      [OpenInference.TOKEN_COUNT_PROMPT]: 35_600,
+      [OpenInference.TOKEN_COUNT_COMPLETION]: 210,
+      // Was 1,132: the total inherited the gap and compounded it.
+      [OpenInference.TOKEN_COUNT_TOTAL]: 35_810,
+      [OpenInference.TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ]: 34_678,
+      [OpenInference.TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE]: 0,
+      [OpenInference.TOKEN_COUNT_COMPLETION_DETAILS_REASONING]: 64,
+    });
+  });
+
+  it('leaves the cache attributes off a provider that reports none', () => {
+    // The control, and not cosmetic: 0 for an unreported field would make "no
+    // prompt caching on this provider" indistinguishable from "the cache never
+    // hit". It also keeps every existing corpus row byte-identical.
+    const { tracer, spans } = recorder();
+    const subscriber = new TelemetrySubscriber(tracer, new SpanStore(), { now: clock() });
+
+    subscriber.onGenerationStarted(context);
+    subscriber.onGenerationCompleted('trace-1', {
+      usage: { promptTokens: 10, completionTokens: 5 },
+    });
+
+    expect(spans[0]?.attributes).toMatchObject({
+      [GenAi.USAGE_INPUT_TOKENS]: 10,
+      [OpenInference.TOKEN_COUNT_TOTAL]: 15,
+    });
+    expect(spans[0]?.attributes).not.toHaveProperty(GenAi.USAGE_CACHE_READ_INPUT_TOKENS);
+    expect(spans[0]?.attributes).not.toHaveProperty(GenAi.USAGE_REASONING_OUTPUT_TOKENS);
+    expect(spans[0]?.attributes).not.toHaveProperty(
+      OpenInference.TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ,
+    );
+  });
 });
 
 describe('captured content', () => {

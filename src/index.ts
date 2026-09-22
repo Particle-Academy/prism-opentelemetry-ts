@@ -12,8 +12,21 @@ export const GenAi = {
   OPERATION_NAME: 'gen_ai.operation.name',
   REQUEST_MODEL: 'gen_ai.request.model',
   RESPONSE_FINISH_REASONS: 'gen_ai.response.finish_reasons',
+  // INCLUDES CACHED TOKENS, by the convention's wording: it "SHOULD include
+  // all types of input tokens, including cached tokens". Prism's promptTokens
+  // is the other way round — normalised to EXCLUDE them — so this attribute is
+  // the sum, not the field. Reconciled in `#applyUsage`.
   USAGE_INPUT_TOKENS: 'gen_ai.usage.input_tokens',
   USAGE_OUTPUT_TOKENS: 'gen_ai.usage.output_tokens',
+  // Checked 2026-09-21 against the LIVE registry, which is now
+  // `open-telemetry/semantic-conventions-genai`: the gen_ai.* attributes moved
+  // there and read "deprecated" in the original repo, which describes the move
+  // rather than a rename. It matters for one of these — the old page spells
+  // cache writes `cache_creation`, the live registry `cache_write` and carries
+  // no `cache_creation` at all. The wrong one is invisible to every backend.
+  USAGE_CACHE_READ_INPUT_TOKENS: 'gen_ai.usage.cache_read.input_tokens',
+  USAGE_CACHE_WRITE_INPUT_TOKENS: 'gen_ai.usage.cache_write.input_tokens',
+  USAGE_REASONING_OUTPUT_TOKENS: 'gen_ai.usage.reasoning.output_tokens',
   TOOL_NAME: 'gen_ai.tool.name',
   TOOL_CALL_ID: 'gen_ai.tool.call.id',
   // Prism-specific, namespaced so they cannot collide with semconv.
@@ -129,6 +142,13 @@ export const OpenInference = {
   TOKEN_COUNT_PROMPT: 'llm.token_count.prompt',
   TOKEN_COUNT_COMPLETION: 'llm.token_count.completion',
   TOKEN_COUNT_TOTAL: 'llm.token_count.total',
+  // SUB-COUNTS of TOKEN_COUNT_PROMPT, in the spec's own words: "they are
+  // already included in it". Prism's promptTokens excludes them, so the prompt
+  // attribute has to be the sum before these are emitted beside it — otherwise
+  // the span publishes a part larger than its whole.
+  TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ: 'llm.token_count.prompt_details.cache_read',
+  TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE: 'llm.token_count.prompt_details.cache_write',
+  TOKEN_COUNT_COMPLETION_DETAILS_REASONING: 'llm.token_count.completion_details.reasoning',
   INPUT_VALUE: 'input.value',
   INPUT_MIME_TYPE: 'input.mime_type',
   OUTPUT_VALUE: 'output.value',
@@ -312,6 +332,12 @@ export interface GenerationContext {
 export interface Usage {
   promptTokens?: number | null;
   completionTokens?: number | null;
+  /** Prompt tokens served from the provider's cache. NOT inside promptTokens. */
+  cacheReadInputTokens?: number | null;
+  /** Prompt tokens written to the provider's cache. NOT inside promptTokens. */
+  cacheWriteInputTokens?: number | null;
+  /** Reasoning tokens. Already inside completionTokens, as providers report it. */
+  thoughtTokens?: number | null;
   cost?: number | null;
 }
 
@@ -611,7 +637,20 @@ export class TelemetrySubscriber {
   #applyUsage(span: Span, usage?: Usage): void {
     if (usage === undefined) return;
 
-    const prompt = usage.promptTokens ?? null;
+    const cacheRead = usage.cacheReadInputTokens ?? null;
+    const cacheWrite = usage.cacheWriteInputTokens ?? null;
+    const reasoning = usage.thoughtTokens ?? null;
+
+    // EVERY TOKEN THAT WENT IN, which is not what promptTokens is. Prism
+    // normalises that field to exclude cache traffic and both conventions
+    // define their input count to include it, so the reconciliation happens
+    // once, here. A cached Anthropic turn reported 922 where 35,600 went in —
+    // a cost view built on it under-reports ~97% on exactly the workload
+    // caching exists for. Reported as prism-opentelemetry#1.
+    const prompt =
+      usage.promptTokens === undefined || usage.promptTokens === null
+        ? null
+        : usage.promptTokens + (cacheRead ?? 0) + (cacheWrite ?? 0);
     const completion = usage.completionTokens ?? null;
 
     if (prompt !== null) {
@@ -626,6 +665,23 @@ export class TelemetrySubscriber {
 
     if (prompt !== null && completion !== null) {
       span.setAttribute(OpenInference.TOKEN_COUNT_TOTAL, prompt + completion);
+    }
+
+    // NULL IS NOT ZERO here either: an unreported field makes "this provider
+    // has no prompt caching" indistinguishable from "the cache never hit".
+    if (cacheRead !== null) {
+      span.setAttribute(GenAi.USAGE_CACHE_READ_INPUT_TOKENS, cacheRead);
+      span.setAttribute(OpenInference.TOKEN_COUNT_PROMPT_DETAILS_CACHE_READ, cacheRead);
+    }
+
+    if (cacheWrite !== null) {
+      span.setAttribute(GenAi.USAGE_CACHE_WRITE_INPUT_TOKENS, cacheWrite);
+      span.setAttribute(OpenInference.TOKEN_COUNT_PROMPT_DETAILS_CACHE_WRITE, cacheWrite);
+    }
+
+    if (reasoning !== null) {
+      span.setAttribute(GenAi.USAGE_REASONING_OUTPUT_TOKENS, reasoning);
+      span.setAttribute(OpenInference.TOKEN_COUNT_COMPLETION_DETAILS_REASONING, reasoning);
     }
 
     // NULL IS NOT ZERO. Not every provider reports a cost, and writing 0 would
