@@ -498,3 +498,103 @@ describe('media inside captured content', () => {
     expect(captured).not.toContain('omitted_bytes');
   });
 });
+
+describe('advertised tools', () => {
+  const tools = [
+    { name: 'search', digest: 'sha256:aaa', description: 'Search the docs', parameters: { q: 'string' } },
+    { name: 'write', digest: 'sha256:bbb', description: 'Write a file', parameters: {} },
+  ];
+
+  it('exports names and digests with captureContent OFF', () => {
+    // prism-opentelemetry#2. A provider caches a prompt PREFIX and the tool
+    // array is part of it, so a consumer explaining a cache miss needs the tool
+    // set. Names and digests are metadata -- authored by the application,
+    // carrying nothing the user wrote -- so they travel ungated, and they have
+    // to, because the question is asked in production and production is where
+    // the gate is off.
+    const { tracer, spans } = recorder();
+    const subscriber = new TelemetrySubscriber(tracer, new SpanStore(), { now: clock() });
+
+    subscriber.onGenerationStarted(context, { prompt: 'a secret' }, tools);
+
+    expect(spans[0]?.attributes).toMatchObject({
+      'llm.tools.0.tool.name': 'search',
+      'llm.tools.1.tool.name': 'write',
+      'prism.tools.0.digest': 'sha256:aaa',
+      'prism.tools.1.digest': 'sha256:bbb',
+    });
+
+    // Both halves matter: the names arrived AND the declarations did not.
+    expect(spans[0]?.attributes).not.toHaveProperty('llm.tools.0.tool.description');
+    expect(spans[0]?.attributes).not.toHaveProperty('llm.tools.0.tool.json_schema');
+    expect(spans[0]?.attributes).not.toHaveProperty(OpenInference.INPUT_VALUE);
+  });
+
+  it('keeps the order they were sent, because a reorder is a cache miss', () => {
+    // A provider caches the array AS SERIALISED, so the same tools reordered is
+    // a different prefix. The index carries that; sorting -- the reflex, since
+    // a set feels more canonical -- would report an unchanged tool set for a
+    // turn that actually missed.
+    const { tracer, spans } = recorder();
+    const subscriber = new TelemetrySubscriber(tracer, new SpanStore(), { now: clock() });
+
+    subscriber.onGenerationStarted(context, undefined, [
+      { name: 'zebra', digest: 'sha256:z' },
+      { name: 'alpha', digest: 'sha256:a' },
+    ]);
+
+    expect(spans[0]?.attributes).toMatchObject({
+      'llm.tools.0.tool.name': 'zebra',
+      'llm.tools.1.tool.name': 'alpha',
+    });
+  });
+
+  it('adds the declarations only when captureContent is ON', () => {
+    const { tracer, spans } = recorder();
+    const subscriber = new TelemetrySubscriber(tracer, new SpanStore(), {
+      now: clock(),
+      captureContent: true,
+    });
+
+    subscriber.onGenerationStarted(context, undefined, tools);
+
+    expect(spans[0]?.attributes).toMatchObject({
+      'llm.tools.0.tool.name': 'search',
+      'llm.tools.0.tool.description': 'Search the docs',
+    });
+    expect(spans[0]?.attributes['llm.tools.0.tool.json_schema']).toBeTypeOf('string');
+  });
+
+  it('caps a hostile name and the number of tools', () => {
+    // A tool name is not always ours: an MCP client builds tools from a REMOTE
+    // server's advertised definitions, and these ride EVERY span because they
+    // are ungated.
+    const { tracer, spans } = recorder();
+    const subscriber = new TelemetrySubscriber(tracer, new SpanStore(), { now: clock() });
+
+    subscriber.onGenerationStarted(
+      context,
+      undefined,
+      Array.from({ length: 100 }, (_, i) => ({ name: 'x'.repeat(5000), digest: `sha256:${i}` })),
+    );
+
+    const keys = Object.keys(spans[0]?.attributes ?? {});
+
+    expect(keys.filter((k) => k.endsWith('.tool.name'))).toHaveLength(64);
+    expect((spans[0]?.attributes['llm.tools.0.tool.name'] as string).length).toBe(512);
+  });
+
+  it('writes nothing for a generation with no tools', () => {
+    // The control. Without it the tests above pass against code that writes a
+    // tool attribute unconditionally, and every embeddings span carries one.
+    const { tracer, spans } = recorder();
+    const subscriber = new TelemetrySubscriber(tracer, new SpanStore(), { now: clock() });
+
+    subscriber.onGenerationStarted(context);
+
+    const keys = Object.keys(spans[0]?.attributes ?? {});
+
+    expect(keys.filter((k) => k.startsWith('llm.tools.'))).toEqual([]);
+    expect(keys.filter((k) => k.startsWith('prism.tools.'))).toEqual([]);
+  });
+});
