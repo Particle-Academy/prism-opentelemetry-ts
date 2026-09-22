@@ -238,9 +238,37 @@ export class SpanStore {
 
   readonly #tools = new Map<string, PendingTool[]>();
 
+  /**
+   * The tool attributes a generation advertised, held until the span is ending.
+   *
+   * NOT written when they arrive, which is the whole reason this exists. An
+   * OpenTelemetry SDK caps a span's attributes — 128 by default in several
+   * implementations — and drops the excess SILENTLY. A tool list is two
+   * attributes per tool, four under capture, so written at START a generation
+   * offering 31 tools filled the span before anything about the OUTCOME of the
+   * call had been set, and a consumer saw roots carrying a model and a tool
+   * list and nothing else, with no error anywhere.
+   *
+   * Held here and written LAST, the same truncation costs the END OF THE TOOL
+   * LIST instead of the result of the call. Both are lossy at the limit; only
+   * one of them is legible.
+   */
+  readonly #advertisedTools = new Map<string, Record<string, string | number | boolean>>();
+
   start(traceId: string, span: Span, startNanos: number): void {
     this.#roots.set(traceId, { span, startNanos });
     this.#boundaries.set(traceId, startNanos);
+  }
+
+  holdAdvertisedTools(traceId: string, attributes: Record<string, string | number | boolean>): void {
+    this.#advertisedTools.set(traceId, attributes);
+  }
+
+  takeAdvertisedTools(traceId: string): Record<string, string | number | boolean> {
+    const held = this.#advertisedTools.get(traceId) ?? {};
+    this.#advertisedTools.delete(traceId);
+
+    return held;
   }
 
   has(traceId: string): boolean {
@@ -327,6 +355,11 @@ export class SpanStore {
     this.#boundaries.delete(traceId);
     this.#stepSpans.delete(traceId);
     this.#tools.delete(traceId);
+    // `takeAdvertisedTools` already clears these on the normal path. Cleared
+    // here too because a generation that never completes would otherwise leave
+    // its tool list behind, which in a long-lived worker is an unbounded hold
+    // on every generation it ever saw.
+    this.#advertisedTools.delete(traceId);
   }
 
   /** How many generations are still open. For a leak check, not for logic. */
@@ -622,7 +655,11 @@ export class TelemetrySubscriber {
       span.setAttribute(OpenInference.USER_ID, context.userId);
     }
 
-    this.#applyTools(span, tools);
+    // HELD, NOT WRITTEN. An SDK caps a span's attributes and drops the excess
+    // silently, and a tool list is two per tool — four under capture. Written
+    // here, a generation offering 31 tools filled the span before usage, finish
+    // reason and output were ever set. See SpanStore's #advertisedTools.
+    this.#store.holdAdvertisedTools(context.traceId, this.#toolAttributes(tools));
     this.#capture(span, OpenInference.INPUT_VALUE, input, OpenInference.INPUT_MIME_TYPE);
     this.#store.start(context.traceId, span, startNanos);
   }
@@ -640,41 +677,43 @@ export class TelemetrySubscriber {
    * name would ride every span in the system. The name cap is separate from
    * `maxContentLength`, which exists so an operator can see more of a PROMPT.
    */
-  #applyTools(span: Span, tools?: readonly AdvertisedTool[]): void {
-    if (tools === undefined) return;
+  #toolAttributes(tools?: readonly AdvertisedTool[]): Record<string, string | number | boolean> {
+    const attributes: Record<string, string | number | boolean> = {};
+
+    if (tools === undefined) return attributes;
 
     tools.slice(0, MAX_TOOLS).forEach((tool, index) => {
       if (typeof tool?.name !== 'string' || typeof tool?.digest !== 'string') return;
 
-      span.setAttribute(
-        `${OpenInference.TOOLS_PREFIX}${index}.${OpenInference.TOOL_FIELD_NAME}`,
-        tool.name.slice(0, MAX_TOOL_NAME_CHARS),
-      );
-      span.setAttribute(
-        `${GenAi.TOOLS_PREFIX}${index}.${GenAi.TOOL_FIELD_DIGEST}`,
-        tool.digest,
-      );
+      attributes[`${OpenInference.TOOLS_PREFIX}${index}.${OpenInference.TOOL_FIELD_NAME}`] =
+        tool.name.slice(0, MAX_TOOL_NAME_CHARS);
+      attributes[`${GenAi.TOOLS_PREFIX}${index}.${GenAi.TOOL_FIELD_DIGEST}`] = tool.digest;
 
-      // The declaration half. `#capture` is the gate, so a caller that supplies
-      // descriptions still gets none on the span while captureContent is off.
+      // The declaration half stays behind the content gate, so a caller that
+      // always supplies descriptions still gets none while captureContent is
+      // off. Checked here rather than through `#capture`, because these are
+      // buffered rather than written — but the gate and the ruler are the same.
+      if (!this.#captureContent) return;
+
       if (typeof tool.description === 'string') {
-        this.#capture(
-          span,
-          `${OpenInference.TOOLS_PREFIX}${index}.${OpenInference.TOOL_FIELD_DESCRIPTION}`,
-          tool.description,
-          null,
-        );
+        attributes[`${OpenInference.TOOLS_PREFIX}${index}.${OpenInference.TOOL_FIELD_DESCRIPTION}`] =
+          this.#bounded(tool.description);
       }
 
-      if (tool.parameters !== undefined) {
-        this.#capture(
-          span,
-          `${OpenInference.TOOLS_PREFIX}${index}.${OpenInference.TOOL_FIELD_JSON_SCHEMA}`,
-          tool.parameters,
-          null,
+      if (tool.parameters !== undefined && tool.parameters !== null) {
+        const encoded = JSON.stringify(
+          this.#captureMedia ? tool.parameters : withoutMediaBytes(tool.parameters),
         );
+
+        if (encoded !== undefined) {
+          attributes[
+            `${OpenInference.TOOLS_PREFIX}${index}.${OpenInference.TOOL_FIELD_JSON_SCHEMA}`
+          ] = this.#bounded(encoded);
+        }
       }
     });
+
+    return attributes;
   }
 
   onStepCompleted(traceId: string, stepIndex: number, model: string, provider: string, usage?: Usage): void {
@@ -748,6 +787,13 @@ export class TelemetrySubscriber {
     this.#applyRateLimits(span, result.rateLimits);
     this.#capture(span, OpenInference.OUTPUT_VALUE, result.output, OpenInference.OUTPUT_MIME_TYPE);
 
+    // LAST, DELIBERATELY. Everything above is a handful of attributes and is
+    // what somebody reads to answer 'what did this cost' and 'did it finish'.
+    // The tool list is two per tool, four under capture, against an SDK ceiling
+    // dropped silently -- so whichever is written last is the one that
+    // disappears on a long tool list, and this is the survivable order.
+    this.#writeHeldTools(span, traceId);
+
     span.setStatus({ code: 'ok' });
     span.end(this.#now());
     this.#store.forget(traceId);
@@ -775,8 +821,21 @@ export class TelemetrySubscriber {
       code: 'error',
       message: error instanceof Error ? error.message : String(error),
     });
+
+    // A failed generation carries its tool list too, and last for the same
+    // reason: the status, the exception and the quota buckets are what a reader
+    // came for.
+    this.#writeHeldTools(span, traceId);
+
     span.end(this.#now());
     this.#store.forget(traceId);
+  }
+
+  /** Write the tool attributes held since the generation started. */
+  #writeHeldTools(span: Span, traceId: string): void {
+    for (const [key, value] of Object.entries(this.#store.takeAdvertisedTools(traceId))) {
+      span.setAttribute(key, value);
+    }
   }
 
   #emitTool(tool: PendingTool, parent: Span, index: number): void {

@@ -517,6 +517,11 @@ describe('advertised tools', () => {
 
     subscriber.onGenerationStarted(context, { prompt: 'a secret' }, tools);
 
+    // Completed, because the tool attributes are written when the span ENDS,
+    // not when it starts -- an SDK drops attributes past its ceiling silently,
+    // so the tool list goes last and only its tail is ever lost.
+    subscriber.onGenerationCompleted('trace-1');
+
     expect(spans[0]?.attributes).toMatchObject({
       'llm.tools.0.tool.name': 'search',
       'llm.tools.1.tool.name': 'write',
@@ -543,6 +548,11 @@ describe('advertised tools', () => {
       { name: 'alpha', digest: 'sha256:a' },
     ]);
 
+    // Completed, because the tool attributes are written when the span ENDS,
+    // not when it starts — an SDK drops attributes past its ceiling silently,
+    // so the tool list goes last and only its tail is ever lost.
+    subscriber.onGenerationCompleted('trace-1');
+
     expect(spans[0]?.attributes).toMatchObject({
       'llm.tools.0.tool.name': 'zebra',
       'llm.tools.1.tool.name': 'alpha',
@@ -557,6 +567,11 @@ describe('advertised tools', () => {
     });
 
     subscriber.onGenerationStarted(context, undefined, tools);
+
+    // Completed, because the tool attributes are written when the span ENDS,
+    // not when it starts -- an SDK drops attributes past its ceiling silently,
+    // so the tool list goes last and only its tail is ever lost.
+    subscriber.onGenerationCompleted('trace-1');
 
     expect(spans[0]?.attributes).toMatchObject({
       'llm.tools.0.tool.name': 'search',
@@ -577,6 +592,11 @@ describe('advertised tools', () => {
       undefined,
       Array.from({ length: 100 }, (_, i) => ({ name: 'x'.repeat(5000), digest: `sha256:${i}` })),
     );
+
+    // Completed, because the tool attributes are written when the span ENDS,
+    // not when it starts -- an SDK drops attributes past its ceiling silently,
+    // so the tool list goes last and only its tail is ever lost.
+    subscriber.onGenerationCompleted('trace-1');
 
     const keys = Object.keys(spans[0]?.attributes ?? {});
 
