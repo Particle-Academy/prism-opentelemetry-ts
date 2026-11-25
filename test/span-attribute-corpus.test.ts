@@ -391,7 +391,7 @@ describe('the cross-language span-attribute corpus', () => {
       traceId: 'rate-limited',
       operation: 'text',
       provider: 'anthropic',
-      model: 'claude-sonnet-4-5',
+      model: 'claude-sonnet-5-5',
     });
 
     const error = Object.assign(new Error('rate limited'), {

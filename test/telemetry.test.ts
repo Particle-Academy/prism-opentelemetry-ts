@@ -64,7 +64,7 @@ const context = {
   traceId: 'trace-1',
   operation: 'text',
   provider: 'anthropic',
-  model: 'claude-sonnet-4-5',
+  model: 'claude-sonnet-5-5',
 };
 
 describe('the root span', () => {
@@ -74,12 +74,12 @@ describe('the root span', () => {
 
     subscriber.onGenerationStarted(context);
 
-    expect(spans[0]?.name).toBe('text claude-sonnet-4-5');
+    expect(spans[0]?.name).toBe('text claude-sonnet-5-5');
     expect(spans[0]?.attributes).toMatchObject({
       [GenAi.OPERATION_NAME]: 'text',
       [GenAi.SYSTEM]: 'anthropic',
-      [GenAi.REQUEST_MODEL]: 'claude-sonnet-4-5',
-      [OpenInference.LLM_MODEL_NAME]: 'claude-sonnet-4-5',
+      [GenAi.REQUEST_MODEL]: 'claude-sonnet-5-5',
+      [OpenInference.LLM_MODEL_NAME]: 'claude-sonnet-5-5',
       [OpenInference.SPAN_KIND]: OpenInference.KIND_CHAIN,
     });
   });
