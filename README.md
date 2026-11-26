@@ -55,11 +55,23 @@ new TelemetrySubscriber(myTracer, new SpanStore(), {
 | `captureContent` | **Off.** Prompts, completions and tool arguments are user content, and a span export leaves your application. |
 | `captureMedia` | **Off, and meaningless unless `captureContent` is on.** A serialized message carries each attachment's bytes; `withoutMediaBytes()` keeps a media part's kind and mime type while dropping the payload, so a span can say an image was sent without shipping the image. |
 | `maxContentLength` | 64 KiB. A hostile or merely high-volume payload must not be able to bloat a span or the OTLP export. `0` disables the cap. |
-| `recordExceptions` | On. |
+| `recordExceptions` | On. With `captureContent` off, `recordException` receives only the error's class name, and a failed span's status description is `The generation failed.` |
 
 Two switches rather than one because the answers genuinely differ: a team that
 wants to see prompts in traces very rarely wants megabytes of base64 alongside
 them.
+
+**Exception messages are recorded only when content capture is on.** An error's
+message and stack can repeat what the application was handling, such as the row
+a database write tried to insert. With `captureContent` off, a failed generation
+or tool span gets the error status and an exception that carries only its class
+name (`exceptionType()`); the message, the stack and any `cause` are not
+exported. The class name is read from the error's prototype chain, never from
+properties the error carries, and only an identifier-shaped name is used. With
+`captureContent` on, the status description is cut to `maxContentLength`, and
+`recordException` receives a copy carrying `name`, `code`, `message` and
+`stack`, each cut to `maxContentLength`; `cause` and other own properties are
+not passed.
 
 ## Tool spans and digests
 

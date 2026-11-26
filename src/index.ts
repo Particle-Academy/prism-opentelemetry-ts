@@ -509,6 +509,13 @@ export interface RateLimit {
 }
 
 export interface TelemetryOptions {
+  /**
+   * Hand a failure's exception to `recordException`. On by default.
+   *
+   * With `captureContent` off the span receives `{ name }` alone, the error's
+   * class name, rather than the error itself: an exception's message and stack
+   * can repeat the content the application was handling.
+   */
   recordExceptions?: boolean;
   /**
    * Cap the length of any single captured-content attribute.
@@ -524,6 +531,10 @@ export interface TelemetryOptions {
    * values are user content, and a span export leaves the application. The
    * reference gates the same values; here it is a single explicit switch so
    * nobody has to infer from three config keys whether content is leaving.
+   *
+   * It also decides how much of a failure is exported. Off, a failed span's
+   * status description is `FAILED_DESCRIPTION` and `recordException` receives
+   * only the error's class name; on, both carry the error itself.
    */
   captureContent?: boolean;
   /**
@@ -540,6 +551,61 @@ export interface TelemetryOptions {
 }
 
 const MEDIA_KINDS = new Set(['image', 'audio', 'video', 'document']);
+
+/** A thrown value's message, for the status description under capture. */
+function errorMessage(error: unknown): string {
+  try {
+    const message: unknown = isError(error) ? (error as { message?: unknown }).message : error;
+    return typeof message === 'string' ? message : String(message);
+  } catch {
+    return '';
+  }
+}
+
+/** An Error from any realm: `Error.isError` where the runtime has it. */
+function isError(value: unknown): boolean {
+  const check = (Error as unknown as { isError?: (value: unknown) => boolean }).isError;
+  return typeof check === 'function' ? check(value) : value instanceof Error;
+}
+
+/** The status description of a failed generation when content capture is off. */
+export const FAILED_DESCRIPTION = 'The generation failed.';
+
+const CLASS_NAME = /^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/;
+
+/**
+ * The class name of a thrown value, and nothing else from it.
+ *
+ * Read off the PROTOTYPE chain, never the instance: `error.name` and
+ * `error.constructor` are both ordinary writable properties, and
+ * `Object.assign(new Error(m), JSON.parse(body))` copies whatever a response
+ * body says onto them. Only an identifier-shaped name is accepted, and a value
+ * that is not an Error is named by its `typeof`. Never throws: a hostile getter
+ * or proxy yields `Error`.
+ *
+ * A class whose NAME an application builds from data at runtime still exports
+ * that name, if it is identifier-shaped. Do not name exception classes from data.
+ */
+export function exceptionType(error: unknown): string {
+  if (error === null) return 'null';
+  if (typeof error !== 'object' && typeof error !== 'function') return typeof error;
+  try {
+    if (!isError(error)) return typeof error;
+    // Bounded: a proxy can hand back a fresh prototype forever.
+    let hops = 0;
+    for (let proto = Object.getPrototypeOf(error); proto !== null && hops < 64; proto = Object.getPrototypeOf(proto), hops++) {
+      const descriptor = Object.getOwnPropertyDescriptor(proto, 'constructor');
+      if (descriptor === undefined) continue;
+      const constructor: unknown = descriptor.value;
+      if (typeof constructor !== 'function') break;
+      const name: unknown = Object.getOwnPropertyDescriptor(constructor, 'name')?.value;
+      return typeof name === 'string' && CLASS_NAME.test(name) ? name : 'Error';
+    }
+  } catch {
+    // A proxy trap or getter threw; the type is all we wanted from it.
+  }
+  return 'Error';
+}
 
 /**
  * At most this many tools reach a span, and this much of a name.
@@ -803,32 +869,67 @@ export class TelemetrySubscriber {
     const span = this.#store.span(traceId);
     if (span === null) return;
 
-    for (const [index, tool] of this.#store.takeRemainingTools(traceId).entries()) {
-      this.#emitTool(tool, span, index);
+    // A thrown value is not ours: a getter or a proxy trap on it can throw.
+    // Whatever it does, the span ends and the trace is forgotten, and nothing
+    // the bridge reads off the value is allowed to throw into the caller.
+    try {
+      for (const [index, tool] of this.#store.takeRemainingTools(traceId).entries()) {
+        this.#emitTool(tool, span, index);
+      }
+
+      // The 429 is the moment an operator most wants the quota numbers, and it
+      // is the one moment they are guaranteed to be reachable: a rate limited
+      // generation has no response for them to travel on, so they travel on the
+      // error instead.
+      try {
+        if (typeof error === 'object' && error !== null && 'rateLimits' in error) {
+          this.#applyRateLimits(span, (error as { rateLimits?: unknown }).rateLimits);
+        }
+      } catch {
+        // No quota numbers from a value that will not give them up.
+      }
+
+      span.setStatus({
+        code: 'error',
+        message: this.#captureContent ? this.#bounded(errorMessage(error)) : FAILED_DESCRIPTION,
+      });
+
+      if (this.#recordExceptions) this.#recordException(span, error);
+
+      // A failed generation carries its tool list too, and last for the same
+      // reason: the status, the exception and the quota buckets are what a
+      // reader came for.
+      this.#writeHeldTools(span, traceId);
+    } finally {
+      span.end(this.#now());
+      this.#store.forget(traceId);
     }
+  }
 
-    // The 429 is the moment an operator most wants the quota numbers, and it is
-    // the one moment they are guaranteed to be reachable: a rate limited
-    // generation has no response for them to travel on, so they travel on the
-    // error instead.
-    if (typeof error === 'object' && error !== null && 'rateLimits' in error) {
-      this.#applyRateLimits(span, (error as { rateLimits?: unknown }).rateLimits);
+  /**
+   * What `recordException` may see of a failure.
+   *
+   * The error itself only under capture. Otherwise an object carrying the class
+   * name alone, which an OpenTelemetry SDK records as `exception.type` with no
+   * message and no stack.
+   */
+  #exception(error: unknown): unknown {
+    if (!this.#captureContent) return { name: exceptionType(error) };
+    if (typeof error !== 'object' || error === null) return this.#bounded(errorMessage(error));
+
+    // Under capture the message and stack are recorded, cut like every other
+    // captured value. A copy, so the application's own error is not changed.
+    try {
+      const { name, code, message, stack } = error as Record<string, unknown>;
+      return {
+        name: typeof name === 'string' ? this.#bounded(name) : exceptionType(error),
+        ...(typeof code === 'string' || typeof code === 'number' ? { code: this.#bounded(String(code)) } : {}),
+        message: this.#bounded(typeof message === 'string' ? message : ''),
+        ...(typeof stack === 'string' ? { stack: this.#bounded(stack) } : {}),
+      };
+    } catch {
+      return { name: exceptionType(error) };
     }
-
-    if (this.#recordExceptions) span.recordException(error);
-
-    span.setStatus({
-      code: 'error',
-      message: error instanceof Error ? error.message : String(error),
-    });
-
-    // A failed generation carries its tool list too, and last for the same
-    // reason: the status, the exception and the quota buckets are what a reader
-    // came for.
-    this.#writeHeldTools(span, traceId);
-
-    span.end(this.#now());
-    this.#store.forget(traceId);
   }
 
   /** Write the tool attributes held since the generation started. */
@@ -850,23 +951,38 @@ export class TelemetrySubscriber {
     span.setAttribute(OpenInference.SPAN_KIND, OpenInference.KIND_TOOL);
     span.setAttribute(OpenInference.TOOL_NAME, tool.name);
 
-    if (typeof tool.callId === 'string') {
-      span.setAttribute(GenAi.TOOL_CALL_ID, tool.callId);
-      span.setAttribute(OpenInference.TOOL_CALL_ID, tool.callId);
+    // A tool's values are not ours either. Nothing here may throw into the
+    // caller, and the span ends whatever happens.
+    try {
+      if (typeof tool.callId === 'string') {
+        span.setAttribute(GenAi.TOOL_CALL_ID, tool.callId);
+        span.setAttribute(OpenInference.TOOL_CALL_ID, tool.callId);
+      }
+
+      this.#capture(span, OpenInference.TOOL_PARAMETERS, tool.parameters, null);
+      this.#capture(span, OpenInference.INPUT_VALUE, tool.parameters, OpenInference.INPUT_MIME_TYPE);
+      this.#capture(span, OpenInference.OUTPUT_VALUE, tool.result, OpenInference.OUTPUT_MIME_TYPE);
+
+      if (tool.failed) {
+        span.setStatus({ code: 'error' });
+        if (this.#recordExceptions) this.#recordException(span, tool.error);
+      } else {
+        span.setStatus({ code: 'ok' });
+      }
+    } catch {
+      // A tool span with fewer attributes beats a trace that never closes.
+    } finally {
+      span.end(tool.endNanos);
     }
+  }
 
-    this.#capture(span, OpenInference.TOOL_PARAMETERS, tool.parameters, null);
-    this.#capture(span, OpenInference.INPUT_VALUE, tool.parameters, OpenInference.INPUT_MIME_TYPE);
-    this.#capture(span, OpenInference.OUTPUT_VALUE, tool.result, OpenInference.OUTPUT_MIME_TYPE);
-
-    if (tool.failed) {
-      if (this.#recordExceptions) span.recordException(tool.error);
-      span.setStatus({ code: 'error' });
-    } else {
-      span.setStatus({ code: 'ok' });
+  /** `recordException`, which may not throw into the caller or stop the status. */
+  #recordException(span: Span, error: unknown): void {
+    try {
+      span.recordException(this.#exception(error));
+    } catch {
+      // The span's own recordException threw; the status is already set.
     }
-
-    span.end(tool.endNanos);
   }
 
   #applyUsage(span: Span, usage?: Usage): void {
@@ -1012,7 +1128,13 @@ export class TelemetrySubscriber {
   #capture(span: Span, key: string, value: unknown, mimeKey: string | null): void {
     if (!this.#captureContent || value === undefined || value === null) return;
 
-    const text = typeof value === 'string' ? value : JSON.stringify(this.#captureMedia ? value : withoutMediaBytes(value));
+    let text: string | undefined;
+    try {
+      text = typeof value === 'string' ? value : JSON.stringify(this.#captureMedia ? value : withoutMediaBytes(value));
+    } catch {
+      // A BigInt, a cycle or a throwing toJSON: the value is left off the span.
+      return;
+    }
     if (text === undefined) return;
 
     span.setAttribute(key, this.#bounded(text));
@@ -1026,6 +1148,7 @@ export class TelemetrySubscriber {
   }
 
   #bounded(value: string): string {
+    if (typeof value !== 'string') value = String(value);
     if (this.#maxContentLength <= 0 || value.length <= this.#maxContentLength) return value;
 
     return `${value.slice(0, this.#maxContentLength)}…[truncated]`;
