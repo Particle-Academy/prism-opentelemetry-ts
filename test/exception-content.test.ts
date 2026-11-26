@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { SpanStore, TelemetrySubscriber, type Span, type Tracer } from '../src/index.js';
+import { SpanStore, TelemetrySubscriber, exceptionType, type Span, type Tracer } from '../src/index.js';
 
 /**
  * An exception message is content.
@@ -210,6 +210,83 @@ describe('exception content', () => {
       expect(spans[0]!.ended).toBe(true);
       expect(exported(spans)).not.toContain(MARKER);
     }
+  });
+
+  it('ends every span when a tool value will not serialise or its error misbehaves', () => {
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    const loud = new Error(MARKER);
+    Object.defineProperty(loud, 'message', {
+      get() {
+        throw new Error('boom');
+      },
+    });
+
+    for (const captureContent of [false, true]) {
+      for (const parameters of [{ id: 1n }, circular]) {
+        const { tracer, spans } = recorder();
+        const store = new SpanStore();
+        const subscriber = new TelemetrySubscriber(tracer, store, { captureContent, now: () => 0 });
+        subscriber.onGenerationStarted({ traceId: 't', operation: 'text', provider: 'p', model: 'm' });
+        subscriber.onToolInvoked('t', {
+          name: 'x',
+          callId: 'c',
+          stepIndex: null,
+          parameters,
+          result: parameters,
+          failed: true,
+          error: loud,
+        });
+
+        expect(() => subscriber.onGenerationFailed('t', new Error('run failed'))).not.toThrow();
+        expect(store.size).toBe(0);
+        expect(spans.every((span) => span.ended)).toBe(true);
+        expect(spans[0]!.status?.code).toBe('error');
+      }
+    }
+  });
+
+  it('sets the error status even when the span refuses the exception', () => {
+    const spans: Recorded[] = [];
+    const tracer: Tracer = {
+      startSpan(name: string) {
+        const record: Recorded = { name, attributes: {}, status: null, exceptions: [], ended: false };
+        spans.push(record);
+        return {
+          setAttribute: (key, value) => (record.attributes[key] = value),
+          setStatus: (status) => (record.status = status),
+          recordException: () => {
+            throw new Error('span refused');
+          },
+          end: () => {
+            record.ended = true;
+          },
+        };
+      },
+    };
+    const store = new SpanStore();
+    const subscriber = new TelemetrySubscriber(tracer, store, { now: () => 0 });
+    subscriber.onGenerationStarted({ traceId: 't', operation: 'text', provider: 'p', model: 'm' });
+
+    expect(() => subscriber.onGenerationFailed('t', new Error(MARKER))).not.toThrow();
+    expect(spans[0]!.status).toEqual({ code: 'error', message: 'The generation failed.' });
+    expect(spans[0]!.ended).toBe(true);
+    expect(store.size).toBe(0);
+  });
+
+  it('gives up on a prototype chain that never ends', () => {
+    const endless = (): object =>
+      new Proxy(
+        {},
+        {
+          getPrototypeOf: () => endless(),
+          getOwnPropertyDescriptor: () => undefined,
+        },
+      );
+    const error = new Error(MARKER);
+    Object.setPrototypeOf(error, endless());
+
+    expect(exceptionType(error)).toMatch(/^(Error|object)$/);
   });
 
   it('records a non-string message under capture without throwing', () => {
