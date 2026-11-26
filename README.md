@@ -66,7 +66,10 @@ message and stack can repeat what the application was handling, such as the row
 a database write tried to insert. With `captureContent` off, a failed generation
 or tool span gets the error status and an exception that carries only its class
 name (`exceptionType()`); the message, the stack and any `cause` are not
-exported.
+exported. The class name is read from the error's prototype chain, never from
+properties the error carries, and only an identifier-shaped name is used. With
+`captureContent` on, the status description and the message and stack handed to
+`recordException` are each cut to `maxContentLength`.
 
 ## Tool spans and digests
 

@@ -131,7 +131,7 @@ describe('the root span', () => {
     one.onGenerationStarted(context);
     one.onGenerationFailed('trace-1', failure);
 
-    expect(withRecording.spans[0]?.exceptions).toEqual([failure]);
+    expect(withRecording.spans[0]?.exceptions).toMatchObject([{ name: 'Error', message: 'provider is down' }]);
     expect(withRecording.spans[0]?.status).toMatchObject({ code: 'error', message: 'provider is down' });
 
     const without = recorder();

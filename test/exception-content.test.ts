@@ -116,9 +116,73 @@ describe('exception content', () => {
     const spans = run(true);
 
     expect(spans[0]!.status?.message).toContain(MARKER);
-    expect(spans[0]!.exceptions[0]).toBeInstanceOf(Error);
+    expect(spans[0]!.exceptions[0]).toMatchObject({ name: 'Error' });
     expect((spans[0]!.exceptions[0] as Error).message).toContain(MARKER);
+    expect((spans[0]!.exceptions[0] as Error).stack).toContain(MARKER);
     expect((spans[1]!.exceptions[0] as Error).message).toContain(MARKER);
+  });
+
+  it('cuts a captured message and stack to maxContentLength', () => {
+    const { tracer, spans } = recorder();
+    const subscriber = new TelemetrySubscriber(tracer, new SpanStore(), {
+      captureContent: true,
+      maxContentLength: 10,
+      now: () => 0,
+    });
+    subscriber.onGenerationStarted({ traceId: 't', operation: 'text', provider: 'p', model: 'm' });
+    const error = new Error('x'.repeat(5000));
+    subscriber.onGenerationFailed('t', error);
+
+    expect(spans[0]!.status?.message?.length).toBeLessThan(30);
+    const recorded = spans[0]!.exceptions[0] as { message: string; stack: string };
+    expect(recorded.message.length).toBeLessThan(30);
+    expect(recorded.stack.length).toBeLessThan(30);
+    // The application's own error is not changed.
+    expect(error.message).toHaveLength(5000);
+  });
+
+  it('takes no class name from data the error carries', () => {
+    const hostile = [
+      // A response body merged onto an error can set `constructor` and `name`.
+      Object.assign(new Error(MARKER), JSON.parse(`{"constructor":{"name":"${MARKER}"},"name":"${MARKER}"}`)),
+      // A class named from data at runtime: not identifier-shaped, so refused.
+      new ({ [`${MARKER} text`]: class extends Error {} }[`${MARKER} text`]!)(MARKER),
+    ];
+
+    for (const thrown of hostile) {
+      const { tracer, spans } = recorder();
+      const subscriber = new TelemetrySubscriber(tracer, new SpanStore(), { now: () => 0 });
+      subscriber.onGenerationStarted({ traceId: 't', operation: 'text', provider: 'p', model: 'm' });
+      subscriber.onGenerationFailed('t', thrown);
+
+      expect(spans[0]!.exceptions).toEqual([{ name: 'Error' }]);
+      expect(exported(spans)).not.toContain(MARKER);
+    }
+  });
+
+  it('still ends the span when reading the error throws', () => {
+    const error = new Error(MARKER);
+    Object.defineProperty(error, 'constructor', {
+      get() {
+        throw new Error('boom');
+      },
+    });
+    const proxy = new Proxy(new Error(MARKER), {
+      getPrototypeOf() {
+        throw new Error('boom');
+      },
+    });
+
+    for (const thrown of [error, proxy]) {
+      const { tracer, spans } = recorder();
+      const store = new SpanStore();
+      const subscriber = new TelemetrySubscriber(tracer, store, { now: () => 0 });
+      subscriber.onGenerationStarted({ traceId: 't', operation: 'text', provider: 'p', model: 'm' });
+
+      expect(() => subscriber.onGenerationFailed('t', thrown)).not.toThrow();
+      expect(store.size).toBe(0);
+      expect(spans[0]!.exceptions).toEqual([{ name: 'Error' }]);
+    }
   });
 
   it('names a subclass by its class, and a thrown non-Error by its type', () => {

@@ -491,7 +491,19 @@ describe('the cross-language span-attribute corpus', () => {
         expect(exported).not.toContain('carries the content marker');
         expect(span.status_description).toBe(FAILED_DESCRIPTION);
         expect(span.events).toHaveLength(1);
-        expect(Object.keys(span.events![0]!.attributes)).toEqual(['exception.type']);
+
+        // What a language's SDK writes beside the type may differ (Python
+        // always writes a message and a stack trace), but only ever empty: no
+        // message, and a stack trace that is the class name alone.
+        const attributes = span.events![0]!.attributes;
+        expect(attributes).toHaveProperty(['exception.type']);
+        expect(
+          Object.keys(attributes).filter(
+            (key) => !['exception.type', 'exception.message', 'exception.stacktrace', 'exception.escaped'].includes(key),
+          ),
+        ).toEqual([]);
+        expect(attributes['exception.message'] ?? '').toBe('');
+        expect(attributes['exception.stacktrace'] ?? 'type line only').toBe('type line only');
       }
 
       // This language, live, not only as recorded.

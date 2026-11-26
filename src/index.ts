@@ -552,21 +552,47 @@ export interface TelemetryOptions {
 
 const MEDIA_KINDS = new Set(['image', 'audio', 'video', 'document']);
 
+/** A thrown value's message, for the status description under capture. */
+function errorMessage(error: unknown): string {
+  try {
+    return error instanceof Error ? error.message : String(error);
+  } catch {
+    return '';
+  }
+}
+
 /** The status description of a failed generation when content capture is off. */
 export const FAILED_DESCRIPTION = 'The generation failed.';
+
+const CLASS_NAME = /^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/;
 
 /**
  * The class name of a thrown value, and nothing else from it.
  *
- * The CONSTRUCTOR's name rather than `error.name`, which is an ordinary
- * writable property. A value that is not an Error is named by its `typeof`,
- * because a thrown object's own `name` is data, not a class.
+ * Read off the PROTOTYPE chain, never the instance: `error.name` and
+ * `error.constructor` are both ordinary writable properties, and
+ * `Object.assign(new Error(m), JSON.parse(body))` copies whatever a response
+ * body says onto them. Only an identifier-shaped name is accepted, and a value
+ * that is not an Error is named by its `typeof`. Never throws: a hostile getter
+ * or proxy yields `Error`.
  */
 export function exceptionType(error: unknown): string {
   if (error === null) return 'null';
-  if (!(error instanceof Error)) return typeof error;
-  const name = (error.constructor as { name?: unknown } | undefined)?.name;
-  return typeof name === 'string' && name !== '' ? name.slice(0, 256) : 'Error';
+  if (typeof error !== 'object' && typeof error !== 'function') return typeof error;
+  try {
+    if (!(error instanceof Error)) return typeof error;
+    for (let proto = Object.getPrototypeOf(error); proto !== null; proto = Object.getPrototypeOf(proto)) {
+      const descriptor = Object.getOwnPropertyDescriptor(proto, 'constructor');
+      if (descriptor === undefined) continue;
+      const constructor: unknown = descriptor.value;
+      if (typeof constructor !== 'function') break;
+      const name: unknown = Object.getOwnPropertyDescriptor(constructor, 'name')?.value;
+      return typeof name === 'string' && CLASS_NAME.test(name) ? name : 'Error';
+    }
+  } catch {
+    // A proxy trap or getter threw; the type is all we wanted from it.
+  }
+  return 'Error';
 }
 
 /**
@@ -847,11 +873,7 @@ export class TelemetrySubscriber {
 
     span.setStatus({
       code: 'error',
-      message: this.#captureContent
-        ? error instanceof Error
-          ? error.message
-          : String(error)
-        : FAILED_DESCRIPTION,
+      message: this.#captureContent ? this.#bounded(errorMessage(error)) : FAILED_DESCRIPTION,
     });
 
     // A failed generation carries its tool list too, and last for the same
@@ -871,7 +893,22 @@ export class TelemetrySubscriber {
    * message and no stack.
    */
   #exception(error: unknown): unknown {
-    return this.#captureContent ? error : { name: exceptionType(error) };
+    if (!this.#captureContent) return { name: exceptionType(error) };
+    if (typeof error !== 'object' || error === null) return this.#bounded(errorMessage(error));
+
+    // Under capture the message and stack are recorded, cut like every other
+    // captured value. A copy, so the application's own error is not changed.
+    try {
+      const { name, code, message, stack } = error as Record<string, unknown>;
+      return {
+        name: typeof name === 'string' ? name : exceptionType(error),
+        ...(typeof code === 'string' || typeof code === 'number' ? { code } : {}),
+        message: this.#bounded(typeof message === 'string' ? message : ''),
+        ...(typeof stack === 'string' ? { stack: this.#bounded(stack) } : {}),
+      };
+    } catch {
+      return { name: exceptionType(error) };
+    }
   }
 
   /** Write the tool attributes held since the generation started. */
