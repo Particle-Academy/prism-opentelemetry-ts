@@ -122,7 +122,12 @@ describe('the root span', () => {
     const failure = new Error('provider is down');
 
     const withRecording = recorder();
-    const one = new TelemetrySubscriber(withRecording.tracer, new SpanStore(), { now: clock() });
+    // Under capture, so the error itself is recorded. Without it only the class
+    // name is: see exception-content.test.ts.
+    const one = new TelemetrySubscriber(withRecording.tracer, new SpanStore(), {
+      now: clock(),
+      captureContent: true,
+    });
     one.onGenerationStarted(context);
     one.onGenerationFailed('trace-1', failure);
 

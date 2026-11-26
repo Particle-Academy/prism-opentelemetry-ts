@@ -509,6 +509,13 @@ export interface RateLimit {
 }
 
 export interface TelemetryOptions {
+  /**
+   * Hand a failure's exception to `recordException`. On by default.
+   *
+   * With `captureContent` off the span receives `{ name }` alone, the error's
+   * class name, rather than the error itself: an exception's message and stack
+   * can repeat the content the application was handling.
+   */
   recordExceptions?: boolean;
   /**
    * Cap the length of any single captured-content attribute.
@@ -524,6 +531,10 @@ export interface TelemetryOptions {
    * values are user content, and a span export leaves the application. The
    * reference gates the same values; here it is a single explicit switch so
    * nobody has to infer from three config keys whether content is leaving.
+   *
+   * It also decides how much of a failure is exported. Off, a failed span's
+   * status description is `FAILED_DESCRIPTION` and `recordException` receives
+   * only the error's class name; on, both carry the error itself.
    */
   captureContent?: boolean;
   /**
@@ -540,6 +551,23 @@ export interface TelemetryOptions {
 }
 
 const MEDIA_KINDS = new Set(['image', 'audio', 'video', 'document']);
+
+/** The status description of a failed generation when content capture is off. */
+export const FAILED_DESCRIPTION = 'The generation failed.';
+
+/**
+ * The class name of a thrown value, and nothing else from it.
+ *
+ * The CONSTRUCTOR's name rather than `error.name`, which is an ordinary
+ * writable property. A value that is not an Error is named by its `typeof`,
+ * because a thrown object's own `name` is data, not a class.
+ */
+export function exceptionType(error: unknown): string {
+  if (error === null) return 'null';
+  if (!(error instanceof Error)) return typeof error;
+  const name = (error.constructor as { name?: unknown } | undefined)?.name;
+  return typeof name === 'string' && name !== '' ? name.slice(0, 256) : 'Error';
+}
 
 /**
  * At most this many tools reach a span, and this much of a name.
@@ -815,11 +843,15 @@ export class TelemetrySubscriber {
       this.#applyRateLimits(span, (error as { rateLimits?: unknown }).rateLimits);
     }
 
-    if (this.#recordExceptions) span.recordException(error);
+    if (this.#recordExceptions) span.recordException(this.#exception(error));
 
     span.setStatus({
       code: 'error',
-      message: error instanceof Error ? error.message : String(error),
+      message: this.#captureContent
+        ? error instanceof Error
+          ? error.message
+          : String(error)
+        : FAILED_DESCRIPTION,
     });
 
     // A failed generation carries its tool list too, and last for the same
@@ -829,6 +861,17 @@ export class TelemetrySubscriber {
 
     span.end(this.#now());
     this.#store.forget(traceId);
+  }
+
+  /**
+   * What `recordException` may see of a failure.
+   *
+   * The error itself only under capture. Otherwise an object carrying the class
+   * name alone, which an OpenTelemetry SDK records as `exception.type` with no
+   * message and no stack.
+   */
+  #exception(error: unknown): unknown {
+    return this.#captureContent ? error : { name: exceptionType(error) };
   }
 
   /** Write the tool attributes held since the generation started. */
@@ -860,7 +903,7 @@ export class TelemetrySubscriber {
     this.#capture(span, OpenInference.OUTPUT_VALUE, tool.result, OpenInference.OUTPUT_MIME_TYPE);
 
     if (tool.failed) {
-      if (this.#recordExceptions) span.recordException(tool.error);
+      if (this.#recordExceptions) span.recordException(this.#exception(tool.error));
       span.setStatus({ code: 'error' });
     } else {
       span.setStatus({ code: 'ok' });

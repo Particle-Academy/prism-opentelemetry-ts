@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
+  FAILED_DESCRIPTION,
   GenAi,
   SpanStore,
   TelemetrySubscriber,
@@ -33,6 +34,8 @@ interface RecordedSpan {
   name: string;
   status: string;
   attributes: Record<string, unknown>;
+  status_description?: string | null;
+  events?: { name: string; attributes: Record<string, unknown> }[];
 }
 
 interface CorpusRateLimit {
@@ -64,6 +67,7 @@ interface CorpusCase {
     input: Record<string, unknown> | null;
     output: Record<string, unknown> | null;
     rate_limits: CorpusRateLimit[] | null;
+    failure?: { message: string; content_marker: string };
   };
   capture_content: boolean;
   max_content_length: number;
@@ -79,20 +83,27 @@ const corpus = JSON.parse(
 
 /** A tracer that records rather than exports — no SDK, no collector, no clock. */
 function record(entry: CorpusCase): RecordedSpan {
-  const spans: RecordedSpan[] = [];
+  const spans: { span: RecordedSpan; description: string | undefined; exceptions: unknown[] }[] = [];
 
   const tracer: Tracer = {
     startSpan(name: string): Span {
-      const recorded: RecordedSpan = { name, status: 'unset', attributes: {} };
+      const recorded = {
+        span: { name, status: 'unset', attributes: {} } as RecordedSpan,
+        description: undefined as string | undefined,
+        exceptions: [] as unknown[],
+      };
       spans.push(recorded);
       return {
         setAttribute(key, value) {
-          recorded.attributes[key] = value;
+          recorded.span.attributes[key] = value;
         },
         setStatus(status) {
-          recorded.status = status.code;
+          recorded.span.status = status.code;
+          recorded.description = status.message;
         },
-        recordException() {},
+        recordException(error) {
+          recorded.exceptions.push(error);
+        },
         end() {},
       };
     },
@@ -134,7 +145,9 @@ function record(entry: CorpusCase): RecordedSpan {
         })),
   );
 
-  subscriber.onGenerationCompleted(entry.id, {
+  if (g.failure !== undefined) {
+    subscriber.onGenerationFailed(entry.id, new Error(g.failure.message));
+  } else subscriber.onGenerationCompleted(entry.id, {
     finishReason: g.finish_reason,
     rateLimits: g.rate_limits === null ? undefined : g.rate_limits.map(rateLimit),
     usage:
@@ -156,15 +169,51 @@ function record(entry: CorpusCase): RecordedSpan {
 
   expect(spans).toHaveLength(1);
 
-  const span = spans[0]!;
+  const { span, description, exceptions } = spans[0]!;
 
-  return {
+  const recorded: RecordedSpan = {
     name: span.name,
     status: span.status,
-    attributes: Object.fromEntries(
-      Object.entries(span.attributes).sort(([a], [b]) => (a < b ? -1 : 1)),
-    ),
+    attributes: sorted(span.attributes),
   };
+
+  if (g.failure !== undefined) {
+    recorded.status_description = description ?? null;
+    recorded.events = exceptions.map((error) => exceptionEvent(error, g.failure!.content_marker));
+  }
+
+  return recorded;
+}
+
+function sorted(map: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(map).sort(([a], [b]) => (a < b ? -1 : 1)));
+}
+
+/**
+ * The `exception` event an OpenTelemetry JS SDK derives from what the bridge
+ * handed `recordException`: `exception.type` from `code`, else `name`;
+ * `exception.message` from `message` (or the value itself, if a string);
+ * `exception.stacktrace` from `stack`, recorded as `present` or `present,
+ * carries the content marker` because its frames differ between machines.
+ */
+function exceptionEvent(error: unknown, marker: string): { name: string; attributes: Record<string, unknown> } {
+  const attributes: Record<string, unknown> = {};
+
+  if (typeof error === 'string') {
+    attributes['exception.message'] = error;
+  } else if (typeof error === 'object' && error !== null) {
+    const { code, name, message, stack } = error as Record<string, unknown>;
+    if (code) attributes['exception.type'] = String(code);
+    else if (name) attributes['exception.type'] = name;
+    if (message) attributes['exception.message'] = message;
+    if (stack) {
+      attributes['exception.stacktrace'] = String(stack).includes(marker)
+        ? 'present, carries the content marker'
+        : 'present';
+    }
+  }
+
+  return { name: 'exception', attributes: sorted(attributes) };
 }
 
 /**
@@ -194,7 +243,7 @@ function rateLimitAttributesOf(attributes: Record<string, unknown>): Record<stri
 
 describe('the cross-language span-attribute corpus', () => {
   it('is the whole suite, not a subset someone trimmed to green', () => {
-    expect(corpus.cases).toHaveLength(23);
+    expect(corpus.cases).toHaveLength(27);
   });
 
   it.each(corpus.cases)('$id emits its recorded span ($title)', (entry) => {
@@ -213,6 +262,8 @@ describe('the cross-language span-attribute corpus', () => {
       'openinference.span.kind',
       'input.value',
       'input.mime_type',
+      // otel-0024..0027: `exception.type` is each language's own class name.
+      'events',
     ]);
 
     const unexpected = corpus.cases.flatMap((entry) =>
@@ -413,6 +464,40 @@ describe('the cross-language span-attribute corpus', () => {
       'prism.rate_limit.requests.remaining': 0,
       'prism.rate_limit.requests.resets_at_unix': 1788611696,
     });
+  });
+
+  it('keeps the exception message off a failed span with capture off, in all three languages', () => {
+    // otel-0024..0027. An exception's message can repeat content the
+    // application was handling. Asserted across the three RECORDED columns, not
+    // just this one: a row where every language leaks agrees perfectly.
+    const failures = corpus.cases.filter((entry) => entry.generation.failure !== undefined);
+    expect(failures).toHaveLength(4);
+
+    for (const entry of failures) {
+      const { message, content_marker: marker } = entry.generation.failure!;
+      // Vacuity guard: the marker really is in what each bridge was handed.
+      expect(message).toContain(marker);
+
+      for (const span of [entry.spans.php, entry.spans.ts, entry.spans.py]) {
+        const exported = JSON.stringify(span);
+        expect(span.status).toBe('error');
+
+        if (entry.capture_content) {
+          expect(exported).toContain(marker);
+          continue;
+        }
+
+        expect(exported).not.toContain(marker);
+        expect(exported).not.toContain('carries the content marker');
+        expect(span.status_description).toBe(FAILED_DESCRIPTION);
+        expect(span.events).toHaveLength(1);
+        expect(Object.keys(span.events![0]!.attributes)).toEqual(['exception.type']);
+      }
+
+      // This language, live, not only as recorded.
+      if (entry.capture_content) expect(JSON.stringify(record(entry))).toContain(marker);
+      else expect(JSON.stringify(record(entry))).not.toContain(marker);
+    }
   });
 
   it('REFUSES content that reaches it with capture off, which the reference does not', () => {
