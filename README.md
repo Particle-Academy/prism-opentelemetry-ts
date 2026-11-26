@@ -68,8 +68,10 @@ or tool span gets the error status and an exception that carries only its class
 name (`exceptionType()`); the message, the stack and any `cause` are not
 exported. The class name is read from the error's prototype chain, never from
 properties the error carries, and only an identifier-shaped name is used. With
-`captureContent` on, the status description and the message and stack handed to
-`recordException` are each cut to `maxContentLength`.
+`captureContent` on, the status description is cut to `maxContentLength`, and
+`recordException` receives a copy carrying `name`, `code`, `message` and
+`stack`, each cut to `maxContentLength`; `cause` and other own properties are
+not passed.
 
 ## Tool spans and digests
 

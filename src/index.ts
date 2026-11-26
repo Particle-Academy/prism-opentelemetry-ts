@@ -555,10 +555,17 @@ const MEDIA_KINDS = new Set(['image', 'audio', 'video', 'document']);
 /** A thrown value's message, for the status description under capture. */
 function errorMessage(error: unknown): string {
   try {
-    return error instanceof Error ? error.message : String(error);
+    const message: unknown = isError(error) ? (error as { message?: unknown }).message : error;
+    return typeof message === 'string' ? message : String(message);
   } catch {
     return '';
   }
+}
+
+/** An Error from any realm: `Error.isError` where the runtime has it. */
+function isError(value: unknown): boolean {
+  const check = (Error as unknown as { isError?: (value: unknown) => boolean }).isError;
+  return typeof check === 'function' ? check(value) : value instanceof Error;
 }
 
 /** The status description of a failed generation when content capture is off. */
@@ -575,12 +582,15 @@ const CLASS_NAME = /^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/;
  * body says onto them. Only an identifier-shaped name is accepted, and a value
  * that is not an Error is named by its `typeof`. Never throws: a hostile getter
  * or proxy yields `Error`.
+ *
+ * A class whose NAME an application builds from data at runtime still exports
+ * that name, if it is identifier-shaped. Do not name exception classes from data.
  */
 export function exceptionType(error: unknown): string {
   if (error === null) return 'null';
   if (typeof error !== 'object' && typeof error !== 'function') return typeof error;
   try {
-    if (!(error instanceof Error)) return typeof error;
+    if (!isError(error)) return typeof error;
     for (let proto = Object.getPrototypeOf(error); proto !== null; proto = Object.getPrototypeOf(proto)) {
       const descriptor = Object.getOwnPropertyDescriptor(proto, 'constructor');
       if (descriptor === undefined) continue;
@@ -861,28 +871,37 @@ export class TelemetrySubscriber {
       this.#emitTool(tool, span, index);
     }
 
-    // The 429 is the moment an operator most wants the quota numbers, and it is
-    // the one moment they are guaranteed to be reachable: a rate limited
-    // generation has no response for them to travel on, so they travel on the
-    // error instead.
-    if (typeof error === 'object' && error !== null && 'rateLimits' in error) {
-      this.#applyRateLimits(span, (error as { rateLimits?: unknown }).rateLimits);
+    // A thrown value is not ours: a getter or a proxy trap on it can throw.
+    // Whatever it does, the span ends and the trace is forgotten, and nothing
+    // the bridge reads off the value is allowed to throw into the caller.
+    try {
+      // The 429 is the moment an operator most wants the quota numbers, and it
+      // is the one moment they are guaranteed to be reachable: a rate limited
+      // generation has no response for them to travel on, so they travel on the
+      // error instead.
+      try {
+        if (typeof error === 'object' && error !== null && 'rateLimits' in error) {
+          this.#applyRateLimits(span, (error as { rateLimits?: unknown }).rateLimits);
+        }
+      } catch {
+        // No quota numbers from a value that will not give them up.
+      }
+
+      if (this.#recordExceptions) span.recordException(this.#exception(error));
+
+      span.setStatus({
+        code: 'error',
+        message: this.#captureContent ? this.#bounded(errorMessage(error)) : FAILED_DESCRIPTION,
+      });
+
+      // A failed generation carries its tool list too, and last for the same
+      // reason: the status, the exception and the quota buckets are what a
+      // reader came for.
+      this.#writeHeldTools(span, traceId);
+    } finally {
+      span.end(this.#now());
+      this.#store.forget(traceId);
     }
-
-    if (this.#recordExceptions) span.recordException(this.#exception(error));
-
-    span.setStatus({
-      code: 'error',
-      message: this.#captureContent ? this.#bounded(errorMessage(error)) : FAILED_DESCRIPTION,
-    });
-
-    // A failed generation carries its tool list too, and last for the same
-    // reason: the status, the exception and the quota buckets are what a reader
-    // came for.
-    this.#writeHeldTools(span, traceId);
-
-    span.end(this.#now());
-    this.#store.forget(traceId);
   }
 
   /**
@@ -901,8 +920,8 @@ export class TelemetrySubscriber {
     try {
       const { name, code, message, stack } = error as Record<string, unknown>;
       return {
-        name: typeof name === 'string' ? name : exceptionType(error),
-        ...(typeof code === 'string' || typeof code === 'number' ? { code } : {}),
+        name: typeof name === 'string' ? this.#bounded(name) : exceptionType(error),
+        ...(typeof code === 'string' || typeof code === 'number' ? { code: this.#bounded(String(code)) } : {}),
         message: this.#bounded(typeof message === 'string' ? message : ''),
         ...(typeof stack === 'string' ? { stack: this.#bounded(stack) } : {}),
       };
@@ -1106,6 +1125,7 @@ export class TelemetrySubscriber {
   }
 
   #bounded(value: string): string {
+    if (typeof value !== 'string') value = String(value);
     if (this.#maxContentLength <= 0 || value.length <= this.#maxContentLength) return value;
 
     return `${value.slice(0, this.#maxContentLength)}…[truncated]`;

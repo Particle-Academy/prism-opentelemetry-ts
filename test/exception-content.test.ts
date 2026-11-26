@@ -17,6 +17,7 @@ interface Recorded {
   attributes: Record<string, unknown>;
   status: { code: string; message?: string } | null;
   exceptions: unknown[];
+  ended: boolean;
 }
 
 function recorder(): { tracer: Tracer; spans: Recorded[] } {
@@ -24,14 +25,16 @@ function recorder(): { tracer: Tracer; spans: Recorded[] } {
 
   const tracer: Tracer = {
     startSpan(name: string) {
-      const record: Recorded = { name, attributes: {}, status: null, exceptions: [] };
+      const record: Recorded = { name, attributes: {}, status: null, exceptions: [], ended: false };
       spans.push(record);
 
       const span: Span = {
         setAttribute: (key, value) => (record.attributes[key] = value),
         setStatus: (status) => (record.status = status),
         recordException: (error) => record.exceptions.push(error),
-        end: () => undefined,
+        end: () => {
+          record.ended = true;
+        },
       };
 
       return span;
@@ -173,7 +176,30 @@ describe('exception content', () => {
       },
     });
 
-    for (const thrown of [error, proxy]) {
+    const hasTrap = new Proxy(new Error(MARKER), {
+      has() {
+        throw new Error('boom');
+      },
+    });
+    const revocable = Proxy.revocable(new Error(MARKER), {});
+    revocable.revoke();
+    const rateLimitsGetter = new Error(MARKER);
+    Object.defineProperty(rateLimitsGetter, 'rateLimits', {
+      get() {
+        throw new Error('boom');
+      },
+    });
+    const bucketGetter = Object.assign(new Error(MARKER), {
+      rateLimits: [
+        {
+          get name(): string {
+            throw new Error('boom');
+          },
+        },
+      ],
+    });
+
+    for (const thrown of [error, proxy, hasTrap, revocable.proxy, rateLimitsGetter, bucketGetter]) {
       const { tracer, spans } = recorder();
       const store = new SpanStore();
       const subscriber = new TelemetrySubscriber(tracer, store, { now: () => 0 });
@@ -181,8 +207,53 @@ describe('exception content', () => {
 
       expect(() => subscriber.onGenerationFailed('t', thrown)).not.toThrow();
       expect(store.size).toBe(0);
-      expect(spans[0]!.exceptions).toEqual([{ name: 'Error' }]);
+      expect(spans[0]!.ended).toBe(true);
+      expect(exported(spans)).not.toContain(MARKER);
     }
+  });
+
+  it('records a non-string message under capture without throwing', () => {
+    for (const message of [5, null, { a: 1 }, undefined]) {
+      const { tracer, spans } = recorder();
+      const store = new SpanStore();
+      const subscriber = new TelemetrySubscriber(tracer, store, { captureContent: true, now: () => 0 });
+      subscriber.onGenerationStarted({ traceId: 't', operation: 'text', provider: 'p', model: 'm' });
+
+      expect(() => subscriber.onGenerationFailed('t', Object.assign(new Error('x'), { message }))).not.toThrow();
+      expect(store.size).toBe(0);
+      expect(spans[0]!.ended).toBe(true);
+      expect(typeof spans[0]!.status?.message).toBe('string');
+    }
+  });
+
+  it('cuts a captured name and code to maxContentLength', () => {
+    const { tracer, spans } = recorder();
+    const subscriber = new TelemetrySubscriber(tracer, new SpanStore(), {
+      captureContent: true,
+      maxContentLength: 10,
+      now: () => 0,
+    });
+    subscriber.onGenerationStarted({ traceId: 't', operation: 'text', provider: 'p', model: 'm' });
+    const error = Object.assign(new Error('x'), { name: 'N'.repeat(5000), code: 'C'.repeat(5000) });
+    subscriber.onGenerationFailed('t', error);
+
+    const recorded = spans[0]!.exceptions[0] as { name: string; code: string };
+    expect(recorded.name.length).toBeLessThan(30);
+    expect(recorded.code.length).toBeLessThan(30);
+  });
+
+  it('names an Error from another realm as an Error', async () => {
+    const { runInNewContext } = await import('node:vm');
+    const foreign = runInNewContext(`new TypeError(${JSON.stringify(MARKER)})`) as unknown;
+    const { tracer, spans } = recorder();
+    const subscriber = new TelemetrySubscriber(tracer, new SpanStore(), { now: () => 0 });
+    subscriber.onGenerationStarted({ traceId: 't', operation: 'text', provider: 'p', model: 'm' });
+    subscriber.onGenerationFailed('t', foreign);
+
+    const name = (spans[0]!.exceptions[0] as { name: string }).name;
+    // Error.isError (Node 24+) recognises it; older runtimes fall back to typeof.
+    expect(['TypeError', 'object']).toContain(name);
+    expect(exported(spans)).not.toContain(MARKER);
   });
 
   it('names a subclass by its class, and a thrown non-Error by its type', () => {

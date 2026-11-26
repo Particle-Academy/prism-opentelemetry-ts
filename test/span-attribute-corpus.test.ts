@@ -179,7 +179,9 @@ function record(entry: CorpusCase): RecordedSpan {
 
   if (g.failure !== undefined) {
     recorded.status_description = description ?? null;
-    recorded.events = exceptions.map((error) => exceptionEvent(error, g.failure!.content_marker));
+    recorded.events = exceptions
+      .map((error) => exceptionEvent(error, g.failure!.content_marker))
+      .filter((event): event is { name: string; attributes: Record<string, unknown> } => event !== null);
   }
 
   return recorded;
@@ -196,7 +198,7 @@ function sorted(map: Record<string, unknown>): Record<string, unknown> {
  * `exception.stacktrace` from `stack`, recorded as `present` or `present,
  * carries the content marker` because its frames differ between machines.
  */
-function exceptionEvent(error: unknown, marker: string): { name: string; attributes: Record<string, unknown> } {
+function exceptionEvent(error: unknown, marker: string): { name: string; attributes: Record<string, unknown> } | null {
   const attributes: Record<string, unknown> = {};
 
   if (typeof error === 'string') {
@@ -212,6 +214,9 @@ function exceptionEvent(error: unknown, marker: string): { name: string; attribu
         : 'present';
     }
   }
+
+  // The SDK records nothing, and warns, when it can name neither.
+  if (!attributes['exception.type'] && !attributes['exception.message']) return null;
 
   return { name: 'exception', attributes: sorted(attributes) };
 }
